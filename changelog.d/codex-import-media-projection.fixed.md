@@ -1,0 +1,1 @@
+- Project imported Responses user images and function-call output image arrays as ordered typed content for compression while retaining exact native items for unchanged primary replay, including opaque non-image carriers. Activate the imported session only after its store and output artifacts have been completed successfully.

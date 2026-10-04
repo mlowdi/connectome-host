@@ -26,6 +26,7 @@ async function runEvacuator(args: string[], options: {
   try {
     const sessions = new SessionManager(dir);
     const selected = sessions.createSession('chosen-session');
+    sessions.setActiveSession(selected.id);
     const duplicate = duplicateTitle ? sessions.createSession(duplicateTitle) : undefined;
     if (duplicate) {
       writeFileSync(join(dir, 'sessions', duplicate.id + '.import-source.json'), JSON.stringify({ agentName: 'Other Import' }));

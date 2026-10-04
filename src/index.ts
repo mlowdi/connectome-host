@@ -58,7 +58,7 @@ import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChil
 import { toolClassConfig } from './tool-lifecycle-config.js';
 import { SessionManager } from './session-manager.js';
 import { resolveAgentName } from './agent-name.js';
-import { generateSessionName } from './synesthete.js';
+import { setupSynesthete } from './synesthete.js';
 import {
   type Recipe,
   DEFAULT_RECIPE,
@@ -124,8 +124,10 @@ interface AppContext {
    *  Its presence is what flips usage readouts from dollars to percent. */
   quotaMeter: QuotaMeter | null;
 
-  /** Stop current framework, switch to a different session, start new framework. */
+  /** Replace the runtime transactionally; restore the current session on failure. */
   switchSession(id: string): Promise<void>;
+  /** Rebind operator observers before a replacement runtime starts. */
+  onFrameworkChanged(listener: (framework: AgentFramework) => void): () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -620,50 +622,6 @@ function getWebUiModule(framework: AgentFramework): WebUiModule | null {
 }
 
 // ---------------------------------------------------------------------------
-// Synesthete auto-naming hook
-// ---------------------------------------------------------------------------
-
-function setupSynesthete(app: AppContext): void {
-  const agentName = app.agentName;
-  const namingExamples = app.recipe.sessionNaming?.examples;
-
-  app.framework.onTrace((event) => {
-    if (event.type !== 'message:added') return;
-    const e = event as unknown as { source: string };
-    if (e.source !== 'external-message') return;
-
-    app.userMessageCount++;
-    if (app.userMessageCount !== 3) return;
-
-    const session = app.sessionManager.getActiveSession();
-    if (!session || session.manuallyNamed) return;
-
-    const agent = app.framework.getAgent(agentName);
-    const cm = agent?.getContextManager();
-    if (!cm) return;
-
-    const { messages } = cm.queryMessages({});
-    const summary = messages
-      .filter(m => m.content.some((b: { type: string }) => b.type === 'text'))
-      .slice(0, 6)
-      .map(m => {
-        const text = m.content
-          .filter((b: { type: string }): b is { type: 'text'; text: string } => b.type === 'text')
-          .map((b: { text: string }) => b.text)
-          .join(' ');
-        return `${m.participant}: ${text.slice(0, 200)}`;
-      })
-      .join('\n');
-
-    generateSessionName(app.membrane, summary, namingExamples).then(name => {
-      if (name) {
-        app.sessionManager.renameSession(session.id, name, false);
-      }
-    });
-  });
-}
-
-// ---------------------------------------------------------------------------
 // MCPL subprocess stderr log — receipts for "why did that MCPL server break"
 // ---------------------------------------------------------------------------
 
@@ -733,7 +691,7 @@ async function runPiped(app: AppContext) {
 
   let inferenceResolve: (() => void) | null = null;
 
-  app.framework.onTrace((event) => {
+  const onTrace: Parameters<AgentFramework['onTrace']>[0] = (event) => {
     const e = event as unknown as Record<string, unknown>;
     switch (event.type) {
       case 'inference:started':
@@ -766,6 +724,11 @@ async function runPiped(app: AppContext) {
         break;
       }
     }
+  };
+  let detachTrace = app.framework.onTrace(onTrace);
+  const detachFrameworkChanges = app.onFrameworkChanged((replacement) => {
+    detachTrace();
+    detachTrace = replacement.onTrace(onTrace);
   });
 
   function waitForInference(): Promise<void> {
@@ -791,8 +754,12 @@ async function runPiped(app: AppContext) {
         }
       }
       if (result.switchToSessionId) {
-        await app.switchSession(result.switchToSessionId);
-        console.log('Session switched.');
+        try {
+          await app.switchSession(result.switchToSessionId);
+          console.log('Session switched.');
+        } catch (error) {
+          console.error(`Session switch failed: ${String(error)}`);
+        }
       }
     } else {
       app.framework.pushEvent({
@@ -816,6 +783,8 @@ async function runPiped(app: AppContext) {
     }
     console.log('Done.');
     await app.framework.stop();
+    detachFrameworkChanges();
+    detachTrace();
     return;
   }
 
@@ -830,6 +799,8 @@ async function runPiped(app: AppContext) {
   await new Promise<void>(r => rl.on('close', r));
   console.log('\nShutting down...');
   await app.framework.stop();
+  detachFrameworkChanges();
+  detachTrace();
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,6 +1084,7 @@ async function main() {
   let activeSession = sessionManager.getActiveSession();
   if (!activeSession) {
     activeSession = sessionManager.createSession();
+    sessionManager.setActiveSession(activeSession.id);
   }
 
   const resolved = resolveAgentName({
@@ -1157,6 +1129,15 @@ async function main() {
 
   const storePath = sessionManager.getStorePath(activeSession.id);
   const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule, callLedger, quotaMeter);
+  let frameworkSessionId = activeSession.id;
+  let switchingSession = false;
+  const frameworkListeners = new Set<(framework: AgentFramework) => void>();
+  const notifyFrameworkChanged = (replacement: AgentFramework): void => {
+    for (const listener of frameworkListeners) {
+      try { listener(replacement); }
+      catch (error) { console.error('Framework observer rebinding failed:', error); }
+    }
+  };
 
   // Build app context
   const app: AppContext = {
@@ -1171,22 +1152,67 @@ async function main() {
     callLedger,
     quotaMeter,
 
+    onFrameworkChanged(listener) {
+      frameworkListeners.add(listener);
+      return () => { frameworkListeners.delete(listener); };
+    },
+
     async switchSession(id: string) {
-      handleExport(this);
-      await this.framework.stop();
-      sessionManager.setActiveSession(id);
-      const newStorePath = sessionManager.getStorePath(id);
-      // Note: agentName stays as resolved at startup. A per-session
-      // re-resolution would matter only if recipe.agent.name is absent
-      // AND the user switches between imports that used different
-      // --agent values; not the canonical flow.
-      this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter);
-      this.framework.start();
-      this.userMessageCount = 0;
-      resetBranchState(this.branchState);
-      setupSynesthete(this);
-      setupMcplStderrLog(this, newStorePath);
-      getWebUiModule(this.framework)?.setApp(this);
+      if (switchingSession) throw new Error('A session switch is already in progress.');
+      if (!sessionManager.findSession(id)) throw new Error(`Session "${id}" not found.`);
+      if (id === frameworkSessionId) return;
+
+      switchingSession = true;
+      const previousId = frameworkSessionId;
+      const previousCount = this.userMessageCount;
+      let stopped = false;
+      let replacement: AgentFramework | undefined;
+      try {
+        handleExport(this);
+        await this.framework.stop();
+        stopped = true;
+        const newStorePath = sessionManager.getStorePath(id);
+        // Keep the startup-resolved participant; a session switch must not
+        // invent a different agent identity from an import sidecar.
+        replacement = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter);
+        sessionManager.setActiveSession(id);
+        this.framework = replacement;
+        frameworkSessionId = id;
+        this.userMessageCount = 0;
+        setupSynesthete(this);
+        setupMcplStderrLog(this, newStorePath);
+        notifyFrameworkChanged(replacement);
+        replacement.start();
+        getWebUiModule(replacement)?.setApp(this);
+        resetBranchState(this.branchState);
+      } catch (error) {
+        if (!stopped) throw error;
+        const failures: unknown[] = [error];
+        if (replacement) {
+          try { await replacement.stop(); } catch (cleanupError) { failures.push(cleanupError); }
+        }
+        try {
+          sessionManager.setActiveSession(previousId);
+          const previousPath = sessionManager.getStorePath(previousId);
+          // stop() closes the queue and owned Chronicle store. Recovery needs
+          // a fresh runtime, not start() on the stopped object.
+          const restored = await createFramework(membrane, previousPath, recipe, this.agentName, settingsModule, callLedger, quotaMeter);
+          this.framework = restored;
+          frameworkSessionId = previousId;
+          this.userMessageCount = previousCount;
+          setupSynesthete(this);
+          setupMcplStderrLog(this, previousPath);
+          notifyFrameworkChanged(restored);
+          restored.start();
+          getWebUiModule(restored)?.setApp(this);
+        } catch (recoveryError) {
+          failures.push(recoveryError);
+        }
+        if (failures.length > 1) throw new AggregateError(failures, 'Session switch failed; recovery or cleanup also failed.');
+        throw error;
+      } finally {
+        switchingSession = false;
+      }
     },
   };
 

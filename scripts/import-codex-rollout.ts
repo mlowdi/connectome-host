@@ -14,7 +14,7 @@ import {
 } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '@animalabs/context-manager';
-import type { ContentBlock } from '@animalabs/membrane';
+import { projectResponsesItem, type ContentBlock } from '@animalabs/membrane';
 import { SessionManager } from '../src/session-manager.js';
 
 interface RolloutRecord {
@@ -87,62 +87,9 @@ export function reconstructEffectiveHistory(records: RolloutRecord[]): Effective
   return history;
 }
 
-function textFromContent(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  return content
-    .map(part => {
-      if (!part || typeof part !== 'object') return '';
-      const value = part as Record<string, unknown>;
-      return typeof value.text === 'string' ? value.text
-        : typeof value.refusal === 'string' ? value.refusal
-        : '';
-    })
-    .filter(Boolean)
-    .join('\n');
-}
-
-/** A human-readable Chronicle projection. `rawItem` is the load-bearing field:
- * the Responses formatter emits it verbatim and ignores the projection. */
-export function projectItem(item: NativeItem): ContentBlock[] {
-  const carrier = <T extends ContentBlock>(block: T): ContentBlock =>
-    ({ ...block, rawItem: item } as ContentBlock);
-
-  switch (item.type) {
-    case 'message':
-      return [carrier({ type: 'text', text: textFromContent(item.content) })];
-    case 'reasoning':
-      if (typeof item.encrypted_content === 'string') {
-        return [carrier({ type: 'redacted_thinking', data: item.encrypted_content })];
-      }
-      return [carrier({ type: 'thinking', thinking: textFromContent(item.summary) })];
-    case 'compaction':
-      return [carrier({
-        type: 'redacted_thinking',
-        data: typeof item.encrypted_content === 'string' ? item.encrypted_content : '',
-      })];
-    case 'function_call':
-      return [carrier({
-        type: 'tool_use',
-        id: String(item.call_id ?? item.id ?? ''),
-        name: String(item.name ?? ''),
-        input: (() => {
-          try { return JSON.parse(String(item.arguments ?? '{}')) as Record<string, unknown>; }
-          catch { return { _rawArguments: item.arguments }; }
-        })(),
-      })];
-    case 'function_call_output':
-      return [carrier({
-        type: 'tool_result',
-        toolUseId: String(item.call_id ?? ''),
-        content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? null),
-      })];
-    default:
-      // Custom tool calls/outputs and future item types stay opaque. The
-      // zero-width projection avoids injecting synthetic text into the model.
-      return [carrier({ type: 'text', text: '' })];
-  }
-}
+/** Share the primary/auxiliary media projection with Membrane. rawItem remains
+ * authoritative for unchanged native replay; policy clones only affected media. */
+export const projectItem = projectResponsesItem;
 
 function participantFor(item: NativeItem, agentName: string): string {
   if (item.type === 'message') return item.role === 'assistant' ? agentName : 'user';
@@ -274,6 +221,9 @@ async function main() {
     '',
   ].join('\n'));
 
+  // createSession is intentionally inactive: publish it only after the store
+  // is closed and every import artifact has been written successfully.
+  sessionManager.setActiveSession(session.id);
   console.log(JSON.stringify({
     instanceDir: opts.outDir,
     dataDir,

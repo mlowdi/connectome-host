@@ -31,6 +31,8 @@ import type { AgentFramework } from '@animalabs/agent-framework';
 import { KnowledgeStrategy } from '@animalabs/agent-framework';
 import { isToolResultContent, isToolUseContent } from '@animalabs/membrane';
 import type { ContentBlock } from '@animalabs/membrane';
+import { defaultTokenEstimator, jsonTokenEstimator } from '@animalabs/context-manager';
+import { measureContent } from '../content-accounting.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1421,18 +1423,16 @@ export class SubagentModule implements Module {
     messages: Array<{ content: ContentBlock[] }>,
     tools: ToolDefinition[],
   ): number {
-    let tokens = Math.ceil(systemPrompt.length / 4) + 50; // system + overhead
+    let tokens = defaultTokenEstimator(systemPrompt) + 50; // system + overhead
 
     for (const msg of messages) {
       tokens += 50; // per-message overhead (role, formatting)
-      for (const block of msg.content) {
-        tokens += Math.ceil(JSON.stringify(block).length / 4);
-      }
+      tokens += measureContent(msg.content).tokens;
     }
 
     for (const tool of tools) {
       tokens += 100; // per-tool overhead
-      tokens += Math.ceil(JSON.stringify(tool).length / 4);
+      tokens += jsonTokenEstimator(JSON.stringify(tool));
     }
 
     return tokens;
@@ -1917,11 +1917,9 @@ export class SubagentModule implements Module {
                 )
               : null;
 
-            const seen = new Set<string>();
+            // Repeated turns are real history, not duplicates. Preserve their
+            // multiplicity without serializing opaque carriers/media as keys.
             const addMsg = (msg: { participant: string; content: ContentBlock[] }) => {
-              const key = msg.participant + '\0' + JSON.stringify(msg.content);
-              if (seen.has(key)) return;
-              seen.add(key);
               const participant = msg.participant === parentAgent.name ? agentName : msg.participant;
               contextManager.addMessage(participant, msg.content);
             };

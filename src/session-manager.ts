@@ -94,7 +94,7 @@ export class SessionManager {
     return randomBytes(4).toString('hex'); // 8 hex chars
   }
 
-  /** Create a new session and persist the index. Returns the new session metadata. */
+  /** Create an inactive session. Activate it only after its runtime is ready. */
   createSession(name?: string): SessionMeta {
     const index = this.load();
     const id = this.generateId();
@@ -114,7 +114,6 @@ export class SessionManager {
     mkdirSync(this.sessionsDir, { recursive: true });
 
     index.sessions[id] = session;
-    index.activeSessionId = id;
     this.save(index);
 
     return session;

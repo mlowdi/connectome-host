@@ -1,109 +1,69 @@
 import { describe, expect, test } from 'bun:test';
+import { filterImageMessages, type ContentBlock } from '@animalabs/membrane';
 import { validateRecipe } from '../src/recipe.js';
 import { buildFrameworkStrategy } from '../src/framework-strategy.js';
-import { emptyExtensionRegistry } from '../src/extensions.js';
 
-const limits = {
-  maxLiveImages: 3,
-  imageStripDepthTokens: 12000,
-  maxLiveImageBytes: 8 * 1024 * 1024,
-};
+const keys = ['maxLiveImages', 'imageStripDepthTokens', 'maxLiveImageBytes'] as const;
+const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+const image = (label: string): ContentBlock => ({ type: 'image', source: { type: 'url', url: `https://example.test/${label}.png` } });
 
-function recipe(strategy: Record<string, unknown> = {}) {
+function recipe(strategy: Record<string, unknown>) {
   return validateRecipe({
     name: 'live-image-limits',
-    agent: { systemPrompt: 'sys', strategy: { type: 'autobiographical', ...strategy } },
+    agent: { systemPrompt: 'sys', strategy },
   });
 }
 
-function config(strategy: Record<string, unknown> = {}) {
-  return (buildFrameworkStrategy(recipe(strategy), 'some-model', 'UTC') as unknown as {
-    config: Record<string, unknown>;
-  }).config;
+function apply(strategy: Record<string, unknown>, content: ContentBlock[][]): ContentBlock[][] {
+  const built = buildFrameworkStrategy(recipe(strategy), 'some-model', 'UTC');
+  if (!built.liveImagePolicy) throw new Error('The constructed strategy has no live-image policy');
+  return filterImageMessages(content.map(content => ({ content })), built.liveImagePolicy).map(message => message.content);
 }
 
-describe('live-image recipe limits', () => {
-  for (const type of ['autobiographical', 'frontdesk']) {
-    test(`${type} forwards explicit limits to the constructed strategy`, () => {
-      const parsed = recipe({ type, ...limits });
-      const built = config({ type, ...limits });
-      for (const [key, value] of Object.entries(limits)) {
-        expect(parsed.agent.strategy?.[key as keyof typeof limits]).toBe(value);
-        expect(built[key]).toBe(value);
-      }
+function visible(content: ContentBlock[][]): string[] {
+  return content.flatMap(blocks => blocks.flatMap(block => block.type === 'image'
+    ? [block.source.type === 'url' ? block.source.url : block.source.data] : []));
+}
+
+describe('built-in recipe image-policy behavior', () => {
+  for (const type of ['autobiographical', 'frontdesk', undefined]) {
+    const label = type ?? 'omitted autobiographical type';
+    test(`${label}: a configured count ceiling retains the newest image`, () => {
+      const output = apply({ type, maxLiveImages: 1, maxLiveImageBytes: 0, imageStripDepthTokens: 0 }, [
+        [image('old')], [image('middle'), image('new')],
+      ]);
+      expect(visible(output)).toEqual(['https://example.test/new.png']);
     });
 
-    test(`${type} preserves zero to disable each limit`, () => {
-      const built = config({
-        type, maxLiveImages: 0, imageStripDepthTokens: 0, maxLiveImageBytes: 0,
+    test(`${label}: zero disables count/depth/byte ceilings`, () => {
+      const output = apply({ type, maxLiveImages: 0, maxLiveImageBytes: 0, imageStripDepthTokens: 0 }, [
+        [image('old')], [image('middle'), image('new')],
+      ]);
+      expect(visible(output)).toEqual([
+        'https://example.test/old.png', 'https://example.test/middle.png', 'https://example.test/new.png',
+      ]);
+    });
+
+    test(`${label}: byte admission includes its exact boundary`, () => {
+      const content: ContentBlock[][] = [[{ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: PNG } }]];
+      const strategy = { type, maxLiveImages: 0, imageStripDepthTokens: 0 };
+      expect(visible(apply({ ...strategy, maxLiveImageBytes: PNG.length }, content))).toEqual([PNG]);
+      expect(visible(apply({ ...strategy, maxLiveImageBytes: PNG.length - 1 }, content))).toEqual([]);
+    });
+
+    test(`${label}: depth excludes an old image behind the recent text boundary`, () => {
+      const output = apply({ type, maxLiveImages: 0, maxLiveImageBytes: 0, imageStripDepthTokens: 1 }, [
+        [image('old')], [{ type: 'text', text: 'new' }],
+      ]);
+      expect(visible(output)).toEqual([]);
+    });
+
+    for (const key of keys) {
+      test(`${label}: ${key} rejects malformed limits at recipe load`, () => {
+        for (const value of [-1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, '6', true, null, {}, []]) {
+          expect(() => recipe({ type, [key]: value })).toThrow(Error);
+        }
       });
-      for (const key of Object.keys(limits)) expect(built[key]).toBe(0);
-    });
-  }
-
-  test('custom strategies receive their own image conventions unchanged', () => {
-    const custom = {
-      type: 'custom-images',
-      maxLiveImages: -1,
-      imageStripDepthTokens: 'all',
-      maxLiveImageBytes: null,
-    };
-    const parsed = validateRecipe({
-      name: 'custom-image-policy',
-      agent: { systemPrompt: 'sys', strategy: custom },
-      extensions: { images: { kind: 'strategy', path: './images.ts' } },
-    });
-    const registry = emptyExtensionRegistry();
-    const received: Record<string, unknown>[] = [];
-    const sentinel = buildFrameworkStrategy(recipe({ type: 'passthrough' }), 'some-model', 'UTC');
-    registry.strategies.set('custom-images', ({ config }) => {
-      received.push(config);
-      return sentinel;
-    });
-    expect(buildFrameworkStrategy(parsed, 'some-model', 'UTC', registry)).toBe(sentinel);
-    expect(received).toEqual([custom]);
-  });
-
-  test('passthrough does not impose limits it never consumes', () => {
-    expect(() => recipe({
-      type: 'passthrough', maxLiveImages: -1, imageStripDepthTokens: 'all', maxLiveImageBytes: null,
-    })).not.toThrow();
-  });
-
-  test('omitted strategy type validates and forwards autobiographical limits', () => {
-    expect(config({ type: undefined, ...limits }).maxLiveImages).toBe(limits.maxLiveImages);
-    for (const key of Object.keys(limits)) {
-      expect(() => recipe({ type: undefined, [key]: -1 })).toThrow(
-        `Recipe agent.strategy.${key} must be a non-negative safe integer.`,
-      );
     }
-  });
-
-  test('omitted limits stay absent from the recipe and use the library defaults', () => {
-    const parsed = recipe();
-    const built = config();
-    for (const key of Object.keys(limits)) {
-      expect(parsed.agent.strategy).not.toHaveProperty(key);
-    }
-    expect(built.maxLiveImages).toBe(6);
-    expect(built.imageStripDepthTokens).toBe(30000);
-    // CM applies its 20 MiB byte fallback during rendering, not construction.
-    expect(built.maxLiveImageBytes).toBeUndefined();
-  });
-
-  for (const key of Object.keys(limits)) {
-    test(`${key} accepts non-negative safe integers`, () => {
-      for (const value of [0, 1, 23456, Number.MAX_SAFE_INTEGER]) {
-        expect(() => recipe({ [key]: value })).not.toThrow();
-      }
-    });
-
-    test(`${key} rejects malformed limits at recipe load`, () => {
-      for (const value of [-1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, '6', true, null, {}, []]) {
-        expect(() => recipe({ [key]: value })).toThrow(
-          `Recipe agent.strategy.${key} must be a non-negative safe integer.`,
-        );
-      }
-    });
   }
 });

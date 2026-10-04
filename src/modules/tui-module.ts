@@ -5,6 +5,7 @@
  * Follows the same pattern as ApiModule's handleMessage().
  */
 
+import type { ContentBlock } from '@animalabs/membrane';
 import type {
   Module,
   ModuleContext,
@@ -34,27 +35,23 @@ export class TuiModule implements Module {
     if (source !== 'tui' && source !== 'cli' && source !== 'system' && source !== 'headless') return {};
 
     const content = (event as { content: unknown }).content;
-    const text = typeof content === 'string' ? content : JSON.stringify(content);
+    const blocks: ContentBlock[] = Array.isArray(content)
+      ? [...content]
+      : [{ type: 'text', text: typeof content === 'string' ? content : JSON.stringify(content) }];
     const triggerInference = (event as { triggerInference?: boolean }).triggerInference;
     const targetAgents = (event as { targetAgents?: string[] }).targetAgents;
 
-    // IPC/headless wakes carry no channel locus: the wake clears any
-    // active-channel routing, so a plain-prose reply is NOT delivered to the
-    // sender — it either falls back to the agent's home/default publish
-    // channel (possibly the wrong audience) or strands in the chronicle
-    // (routeSpeech: "no locus"). Agents can't see that from the message
-    // itself, so tell them explicitly; otherwise they write replies into the
-    // void (labclaude's stranded "Ack, ops" reply, 2026-07-09).
-    const blocks: Array<{ type: 'text'; text: string }> = [{ type: 'text', text }];
+    // IPC has an operator output surface, not an external-channel locus.
+    // Do not confuse absence of a publish target with failed delivery or
+    // invite a reply to a stale/default external audience.
     if (source === 'headless') {
       blocks.push({
         type: 'text',
         text:
-          '[host note: this message arrived over IPC and carries no channel locus — ' +
-          'any active-channel routing from your previous turn no longer applies. A plain-prose ' +
-          'reply will NOT reach the sender: it may fall back to your home/default channel or stay ' +
-          'in your chronicle only. To answer a specific person or channel, use an explicit send tool; ' +
-          'if no reply is needed, none is expected.]',
+          '[host note: this message arrived over IPC without an external-channel locus. ' +
+          'Replies are retained in the archive and exposed to connected operator clients; ' +
+          'this does not establish whether any particular person has read them. Do not publish ' +
+          'to an external channel unless requested; use an explicit send tool for a chosen recipient.]',
       });
     }
 

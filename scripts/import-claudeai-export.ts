@@ -693,12 +693,6 @@ async function main() {
 
   const sessionMgr = new SessionManager(opts.outDir);
 
-  // Snapshot pre-import activeSessionId so a bulk import doesn't silently
-  // steal the operator's working session. createSession() unconditionally
-  // sets activeSessionId; after a 24-convo import we'd land on whichever
-  // conversation was last in the file. Restored at the end.
-  const preImportActive = sessionMgr.load().activeSessionId || null;
-
   let succeeded = 0;
   let branchedCount = 0;
   for (const conv of filtered) {
@@ -713,20 +707,12 @@ async function main() {
         `  ${res.sessionId.padEnd(10)} ${String(res.messageCount).padStart(4)} msgs  ${conv.name}${tag}`,
       );
       succeeded++;
+      if (!opts.dryRun && !sessionMgr.getActiveSession()) {
+        sessionMgr.setActiveSession(res.sessionId);
+      }
       if (res.branched) branchedCount++;
     } catch (err) {
       console.error(`  FAIL  ${conv.name}: ${(err as Error).message}`);
-    }
-  }
-
-  // Restore the pre-import active session (no-op if there wasn't one — but
-  // we still leave activeSessionId as the last-imported id rather than the
-  // first, which feels less wrong if the operator had no active session).
-  if (preImportActive && !opts.dryRun) {
-    try {
-      sessionMgr.setActiveSession(preImportActive);
-    } catch {
-      // Pre-import active session may have been deleted; leave default.
     }
   }
 
