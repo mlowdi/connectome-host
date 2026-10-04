@@ -24,7 +24,7 @@ import type { ContentBlock, NormalizedMessage, ToolDefinition } from '@animalabs
 import type { Recipe } from '../recipe.js';
 import type { CallLedger } from '../call-ledger.js';
 import type { QuotaMeter } from '../quota-meter.js';
-import { measureContent } from '../content-accounting.js';
+import type { StoredContentBlock } from '@animalabs/context-manager';
 import {
   readMcplServersFile,
   DEFAULT_CONFIG_PATH,
@@ -1113,6 +1113,18 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
   return { agent: agentName, stats, exactTotalTokens, lastBilledInputTokens, countModel, countSource };
 }
 
+function countMetadataImages(content: readonly StoredContentBlock[]): number {
+  let count = 0;
+  for (const block of content) {
+    if (block.type === 'image' || (block.type === 'blob_ref' && block.ref.originalType === 'image')) {
+      count++;
+    } else if (block.type === 'tool_result' && Array.isArray(block.content)) {
+      count += countMetadataImages(block.content);
+    }
+  }
+  return count;
+}
+
 /**
  * Context curve: compile the agent's window and return one record per
  * compiled entry with its provenance — kind (raw / L1..Ln summary), rendered
@@ -1141,7 +1153,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
     }).getAgentRuntimeSettings?.(agentName)?.contextBudgetTokens;
     if (typeof live === 'number' && live > 0) maxTokens = live;
   } catch { /* keep the recipe fallback */ }
-  const reserveForResponse = app.recipe.agent.maxTokens ?? 16_384;
+  const reserveForResponse = agent.maxTokens;
   const compiled = await cm.compileMetadata({ maxTokens, reserveForResponse });
 
   // Curve inspection only needs text and source metadata. Resolving every
@@ -1150,7 +1162,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   // reader with blob resolution disabled so production diagnostics stay
   // bounded by text history rather than the media archive.
   const messageCount = cm.getMessageCount();
-  const messages: Array<{ id: string; timestamp?: unknown; content?: unknown[] }> =
+  const messages: Array<{ id: string; timestamp?: unknown; content?: (ContentBlock | StoredContentBlock)[] }> =
     cm.getMessageWindow(0, messageCount, { resolveBlobs: false }).messages;
   const msgById = new Map(messages.map((mm) => [mm.id, mm]));
 
@@ -1180,7 +1192,8 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   for (const e of compiled.messages) {
     const blocks = e.content;
     const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
-    const { tokens: rendered, nImages } = measureContent(blocks);
+    const rendered = cm.estimateContentTokens(blocks, compiled.tokenCalibration);
+    const nImages = countMetadataImages(blocks);
     const sum = e.sourceMessageId || e.sourceMessageIds?.length ? undefined : byHead.get(headOf(text));
     if (sum) {
       const leafIds = leaves(sum).filter((id) => msgById.has(id));
@@ -1188,7 +1201,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
       for (const id of leafIds) {
         if (coveredIds.has(id)) continue;
         coveredIds.add(id);
-        rawCovered += measureContent(msgById.get(id)!.content ?? []).tokens;
+        rawCovered += cm.estimateContentTokens(msgById.get(id)!.content ?? [], compiled.tokenCalibration);
       }
       const dates = leafIds.map((id) => msgById.get(id)!.timestamp).filter(Boolean).sort();
       entries.push({
@@ -1204,7 +1217,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
       for (const source of sources) {
         if (coveredIds.has(source.id)) continue;
         coveredIds.add(source.id);
-        rawCovered += measureContent(source.content ?? []).tokens;
+        rawCovered += cm.estimateContentTokens(source.content ?? [], compiled.tokenCalibration);
       }
       entries.push({
         i: i++, kind: 'raw', id: e.sourceMessageId ?? sourceIds[0] ?? null, participant: e.participant,
@@ -1299,7 +1312,7 @@ export function runContextPreview(
   agentName: string,
   params: Record<string, unknown>,
 ): Record<string, unknown> {
-  requireAgent(app, agentName);
+  const agent = requireAgent(app, agentName);
 
   const budget = Number(params.budget);
   if (!Number.isSafeInteger(budget) || budget <= 0) {
@@ -1359,7 +1372,7 @@ export function runContextPreview(
     // i.e. the threshold above which a compile throws. Its `fits` therefore
     // means "would not hard-fail", NOT "fits the budget you asked for".
     const r = result as { finalTokens?: number; budgetTokens?: number; exhausted?: boolean };
-    const reserve = app.recipe.agent.maxTokens ?? 16_384;
+    const reserve = agent.maxTokens;
     const effectiveBudget = Math.max(0, budget - reserve);
     const finalTokens = typeof r.finalTokens === 'number' ? r.finalTokens : NaN;
     const fitsRequested = Number.isFinite(finalTokens) && finalTokens <= effectiveBudget;

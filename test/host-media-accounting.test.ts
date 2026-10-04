@@ -1,12 +1,14 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, AutobiographicalStrategy, MessageStore, defaultTokenEstimator, jsonTokenEstimator } from '@animalabs/context-manager';
+import { Agent, AgentFramework } from '@animalabs/agent-framework';
+import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, ImageContent } from '@animalabs/membrane';
 import { measureContent } from '../src/content-accounting.js';
-import { buildContextCurve, type PanelAppRef } from '../src/web/panel-data.js';
+import { buildContextCurve, runContextPreview, PanelError, type PanelAppRef } from '../src/web/panel-data.js';
 
 function image(data: string, tokenEstimate?: number): ImageContent {
   return { type: 'image', source: { type: 'base64', mediaType: 'image/png', data }, ...(tokenEstimate !== undefined ? { tokenEstimate } : {}) };
@@ -26,17 +28,22 @@ function withMessageStore<T>(run: (messages: MessageStore, store: JsStore) => T)
 
 // The panel really reads Chronicle's unresolved message window; only selection
 // of the already-compiled window is a fixture. No model or archive reads occur.
-async function curve(content: ContentBlock[][], selected: Array<{ participant: string; content: ContentBlock[] }>, sourceGroups?: number[][]) {
+async function curve(content: ContentBlock[][], selected: Array<{ participant: string; content: ContentBlock[] }>, sourceGroups?: number[][], calibration = 1) {
   const dir = mkdtempSync(join(tmpdir(), 'host-media-curve-'));
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
   MessageStore.register(store);
   const messages = new MessageStore(store);
   const ids = content.map(blocks => messages.append('user', blocks).id);
   const cm = {
-    compileMetadata: async () => ({ messages: selected.map((entry, i) => ({
-      ...entry,
-      ...(sourceGroups ? { sourceMessageIds: sourceGroups[i].map(index => ids[index]) } : { sourceMessageId: ids[i] }),
-    })) }),
+    compileMetadata: async () => ({
+      tokenCalibration: calibration,
+      estimatedTokens: selected.reduce((sum, entry) => sum + messages.estimateContentTokens(entry.content, calibration), 0),
+      messages: selected.map((entry, i) => ({
+        ...entry,
+        ...(sourceGroups ? { sourceMessageIds: sourceGroups[i].map(index => ids[index]) } : { sourceMessageId: ids[i] }),
+      })),
+    }),
+    estimateContentTokens: messages.estimateContentTokens.bind(messages),
     getMessageCount: () => messages.length(),
     getMessageWindow: (offset: number, limit: number, options: { resolveBlobs?: boolean }) => {
       expect(options.resolveBlobs).toBe(false);
@@ -46,7 +53,7 @@ async function curve(content: ContentBlock[][], selected: Array<{ participant: s
     currentBranch: () => ({ name: 'main' }),
   };
   const app = {
-    framework: { getAgent: () => ({ getContextManager: () => cm }), getAgentRuntimeSettings: () => ({ contextBudgetTokens: 123_456 }) },
+    framework: { getAgent: () => ({ maxTokens: 4096, getContextManager: () => cm }), getAgentRuntimeSettings: () => ({ contextBudgetTokens: 123_456 }) },
     recipe: { agent: { contextBudgetTokens: 200_000, maxTokens: 4096 } },
   } as unknown as PanelAppRef;
   // Archive resolution here is a failure, not a permissive mock returning data.
@@ -103,6 +110,227 @@ describe('host semantic content accounting', () => {
   });
 });
 
+describe('live agent response reserves in context diagnostics', () => {
+  let previewClock = Date.now();
+
+  test('real Agent defaults and explicit reserves govern dry curve and framework preview despite stale recipes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'host-reserve-parity-'));
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    MessageStore.register(store);
+    const messages = new MessageStore(store);
+    messages.append('user', [{ type: 'text', text: 'A retained observation' }, image('AAAA', 731)]);
+    const cm = await ContextManager.open({
+      store,
+      strategy: new AutobiographicalStrategy({
+        compressionModel: 'unused-no-model', autoTickOnNewMessage: false, adaptiveResolution: true,
+        headWindowTokens: 10_000, recentWindowTokens: 10_000,
+      }),
+    });
+    const membrane = new Membrane(new MockAdapter(), { formatter: new NativeFormatter() });
+    membrane.complete = async () => { throw new Error('diagnostics ran inference'); };
+    membrane.stream = async () => { throw new Error('diagnostics ran streaming inference'); };
+    store.getBlob = () => { throw new Error('diagnostics resolved archived media'); };
+    cm.compile = async () => { throw new Error('diagnostics called committing compile'); };
+    const compileMetadata = cm.compileMetadata.bind(cm);
+    const previewContext = cm.previewContext.bind(cm);
+    const curveBudgets: unknown[] = [];
+    const previewBudgets: unknown[] = [];
+    cm.compileMetadata = (...args) => { curveBudgets.push(args[0]); return compileMetadata(...args); };
+    cm.previewContext = (...args) => { previewBudgets.push(args[0]); return previewContext(...args); };
+    const clock = spyOn(Date, 'now').mockImplementation(() => previewClock);
+    try {
+      const before = store.currentSequence();
+      const pendingBefore = cm.getPendingWork();
+      for (const [index, fixture] of [
+        { maxTokens: undefined, recipeReserve: 1000, reserve: 4096 },
+        { maxTokens: 2048, recipeReserve: 16_384, reserve: 2048 },
+        { maxTokens: 2000, recipeReserve: 1000, reserve: 2000 },
+      ].entries()) {
+        const agent = new Agent({
+          name: 'root', model: 'unused-no-model', systemPrompt: '', contextBudgetTokens: 16_000,
+          ...(fixture.maxTokens === undefined ? {} : { maxTokens: fixture.maxTokens }),
+        }, cm, membrane);
+        // Only the framework registry is adapted; the actual Framework preview
+        // implementation, Agent default, and CM dry selectors execute unchanged.
+        const agents: Record<string, typeof agent> = { root: agent };
+        const registry = { agents: { get: (name: string) => agents[name] } } as unknown as AgentFramework;
+        const app = {
+          framework: {
+            getAgent: () => agent,
+            getAgentRuntimeSettings: () => ({ contextBudgetTokens: 16_000 }),
+            previewContextSettings: (...args: Parameters<AgentFramework['previewContextSettings']>) =>
+              AgentFramework.prototype.previewContextSettings.call(registry, ...args),
+          },
+          recipe: { agent: { contextBudgetTokens: 99_999, maxTokens: fixture.recipeReserve } },
+        } as unknown as PanelAppRef;
+        const curve = await buildContextCurve(app, 'root');
+        expect(curve.budget).toEqual({ maxTokens: 16_000, reserveForResponse: fixture.reserve });
+        expect(curveBudgets[index]).toEqual(curve.budget);
+        expect(curve.entries).toHaveLength(1);
+        previewClock += 3001; // Advance past the real operator cooldown without waiting.
+        const result = runContextPreview(app, 'root', { budget: 16_000 });
+        const preview = result.preview as { finalTokens: number; budgetTokens: number; exhausted: boolean };
+        const effective = 16_000 - fixture.reserve;
+        expect(previewBudgets[index]).toEqual(curve.budget);
+        expect(result.accounting).toEqual({
+          requestedBudgetTokens: 16_000, reserveForResponseTokens: fixture.reserve,
+          effectiveBudgetTokens: effective, rejectionBudgetTokens: preview.budgetTokens,
+          fitsRequested: preview.finalTokens <= effective,
+          withinGrace: preview.finalTokens <= preview.budgetTokens,
+          unreachable: preview.exhausted && preview.finalTokens > effective,
+        });
+        try {
+          runContextPreview(app, 'root', { budget: 16_000 });
+          throw new Error('preview cooldown was bypassed');
+        } catch (error) {
+          expect(error).toBeInstanceOf(PanelError);
+          expect((error as PanelError).status).toBe(429);
+        }
+        expect(store.currentSequence()).toBe(before);
+        expect(cm.getPendingWork()).toEqual(pendingBefore);
+      }
+    } finally {
+      clock.mockRestore();
+      cm.close();
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test('requested fit, grace tolerance, exhaustion and zero floor use the framework reserve, not recipe', () => {
+    const reserve = 2000;
+    const clock = spyOn(Date, 'now').mockImplementation(() => previewClock);
+    try {
+      for (const fixture of [
+        { budget: 16_000, finalTokens: 14_500, rejection: 14_280, exhausted: true, fitsRequested: false, withinGrace: false, unreachable: true },
+        { budget: 16_000, finalTokens: 14_100, rejection: 14_280, exhausted: true, fitsRequested: false, withinGrace: true, unreachable: true },
+        { budget: 16_000, finalTokens: 14_000, rejection: 14_280, exhausted: true, fitsRequested: true, withinGrace: true, unreachable: false },
+        { budget: 1000, finalTokens: 1, rejection: 0, exhausted: false, fitsRequested: false, withinGrace: false, unreachable: false },
+      ]) {
+        // Fixed selector outputs exercise the hard/grace boundary independently
+        // of the real Agent/CM default and selection evidence above.
+        const cm = { previewContext: (budget: { maxTokens: number; reserveForResponse: number }) => {
+          expect(budget).toEqual({ maxTokens: fixture.budget, reserveForResponse: reserve });
+          return { finalTokens: fixture.finalTokens, budgetTokens: fixture.rejection, exhausted: fixture.exhausted, fits: fixture.withinGrace };
+        } };
+        const agent = { maxTokens: reserve, getContextManager: () => cm };
+        const agents: Record<string, typeof agent> = { root: agent };
+        const registry = { agents: { get: (name: string) => agents[name] } } as unknown as AgentFramework;
+        const app = {
+          framework: {
+            getAgent: () => agent,
+            previewContextSettings: (...args: Parameters<AgentFramework['previewContextSettings']>) =>
+              AgentFramework.prototype.previewContextSettings.call(registry, ...args),
+          },
+          recipe: { agent: { maxTokens: 1000 } },
+        } as unknown as PanelAppRef;
+        previewClock += 3001;
+        expect(runContextPreview(app, 'root', { budget: fixture.budget }).accounting).toEqual({
+          requestedBudgetTokens: fixture.budget, reserveForResponseTokens: reserve,
+          effectiveBudgetTokens: Math.max(0, fixture.budget - reserve), rejectionBudgetTokens: fixture.rejection,
+          fitsRequested: fixture.fitsRequested, withinGrace: fixture.withinGrace, unreachable: fixture.unreachable,
+        });
+      }
+    } finally {
+      clock.mockRestore();
+    }
+  });
+});
+
+describe('context curve snapshot calibration parity', () => {
+  for (const fixture of [
+    { calibration: 1.7, custom: false, mixed: false },
+    ...[0.6, 1.7].flatMap(calibration => [false, true].map(custom => ({ calibration, custom, mixed: true }))),
+  ]) {
+    test(`real metadata and curve agree without mutation (calibration=${fixture.calibration}, custom=${fixture.custom}, mixed=${fixture.mixed})`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'host-calibrated-curve-'));
+      const cm = await ContextManager.open({
+        path: join(dir, 'store'), namespace: 'diagnostic-fixture',
+        ...(fixture.custom ? { tokenEstimator: (value: string) => value.length + 3 } : {}),
+        strategy: new AutobiographicalStrategy({
+          adaptiveResolution: true, autoTickOnNewMessage: false,
+          headWindowTokens: 0, recentWindowTokens: 100_000, targetChunkTokens: 100_000,
+          maxLiveImages: 10, maxLiveImageBytes: 0, imageStripDepthTokens: 0,
+        }),
+      });
+      const content: ContentBlock[] = [{ type: 'text', text: 'x'.repeat(400) }];
+      if (fixture.mixed) content.push(
+        { type: 'text', text: 'a' }, { type: 'text', text: 'b' },
+        { type: 'tool_use', id: 'vision', name: 'inspect', input: { path: 'photo' } },
+        { type: 'tool_result', toolUseId: 'vision', content: [
+          { type: 'text', text: 'nested observation' }, image('AAAA', 731),
+          { type: 'tool_result', toolUseId: 'recalled', content: [image('AQID', 907), { type: 'text', text: 'inside' }] },
+        ] },
+        image('AAAA', 0),
+        { type: 'thinking', thinking: '', signature: 's'.repeat(3300) },
+        { type: 'thinking', thinking: 'not the stamped price', signature: 's'.repeat(3300), tokenEstimate: 7 } as ContentBlock,
+        { type: 'redacted_thinking', data: '', tokenEstimate: 9 } as ContentBlock,
+      );
+      try {
+        if (fixture.mixed) {
+          // A real tool cycle has a preceding assistant use and a separate
+          // user result; bundled assistant results cause generated repairs,
+          // whose existing unattributed coverage policy is not archive-only.
+          cm.addMessage('root', content.filter(block => block.type === 'tool_use'));
+          cm.addMessage('user', content.filter(block => block.type === 'tool_result'));
+          cm.addMessage('root', content.filter(block => block.type !== 'tool_use' && block.type !== 'tool_result'));
+        } else {
+          cm.addMessage('user', content);
+        }
+        const store = cm.getStore();
+        store.setStateJson('diagnostic-fixture/autobio:calibration', { multiplier: fixture.calibration });
+        const membrane = new Membrane(new MockAdapter(), { formatter: new NativeFormatter() });
+        membrane.complete = async () => { throw new Error('curve ran inference'); };
+        membrane.stream = async () => { throw new Error('curve streamed inference'); };
+        const agent = new Agent({ name: 'root', model: 'unused-no-model', systemPrompt: '' }, cm, membrane);
+        const app = {
+          framework: { getAgent: () => agent, getAgentRuntimeSettings: () => ({ contextBudgetTokens: 100_000 }) },
+          recipe: { agent: { maxTokens: 1000, contextBudgetTokens: 99_999 } },
+        } as unknown as PanelAppRef;
+        store.getBlob = () => { throw new Error('calibrated curve opened archived media'); };
+        cm.compile = async () => { throw new Error('calibrated curve called committing compile'); };
+        const liveEstimate = cm.getLiveImagePolicy()!.estimateTokens!;
+        const liveBefore = liveEstimate(content);
+        const stats = cm.getRenderStats();
+        const pending = cm.getPendingWork();
+        const sequence = store.currentSequence();
+        const archive = cm.getMessageWindow(0, cm.getMessageCount(), { resolveBlobs: false }).messages;
+        const metadata = await cm.compileMetadata({ maxTokens: 100_000, reserveForResponse: 4096 });
+        const curve = await buildContextCurve(app, 'root') as {
+          budget: { maxTokens: number; reserveForResponse: number };
+          totals: { rendered: number; rawCovered: number };
+          entries: Array<{ rendered: number; rawCovered: number; nImages: number }>;
+        };
+        expect(metadata.tokenCalibration).toBe(fixture.calibration);
+        expect(curve.budget).toEqual({ maxTokens: 100_000, reserveForResponse: 4096 });
+        expect(curve.totals.rendered).toBe(metadata.estimatedTokens);
+        expect(curve.entries.reduce((sum, entry) => sum + entry.rendered, 0)).toBe(metadata.estimatedTokens);
+        expect(curve.totals.rawCovered).toBe(archive.reduce((sum, message) =>
+          sum + cm.estimateContentTokens(message.content, metadata.tokenCalibration), 0));
+        expect(curve.entries.reduce((sum, entry) => sum + entry.nImages, 0)).toBe(fixture.mixed ? 3 : 0);
+        if (!fixture.mixed) {
+          expect(metadata.estimatedTokens).toBe(235);
+          expect(curve.totals).toEqual({ entries: curve.entries.length, rendered: 235, rawCovered: 235 });
+        }
+        if (fixture.custom) {
+          expect(cm.estimateContentTokens([{ type: 'text', text: 'abc' }], metadata.tokenCalibration))
+            .toBe(Math.round(6 * fixture.calibration));
+          expect(curve.totals.rendered).not.toBe(Math.round(measureContent(content).tokens * fixture.calibration));
+        }
+        expect(await cm.compileMetadata({ maxTokens: 100_000, reserveForResponse: 4096 })).toEqual(metadata);
+        expect(liveEstimate(content)).toBe(liveBefore);
+        expect(cm.getRenderStats()).toEqual(stats);
+        expect(cm.getPendingWork()).toEqual(pending);
+        expect(store.currentSequence()).toBe(sequence);
+        expect(cm.getMessageWindow(0, cm.getMessageCount(), { resolveBlobs: false }).messages).toEqual(archive);
+      } finally {
+        cm.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe('context curve image accounting at the panel boundary', () => {
   test('real Autobiographical selection of new sized refs stays blob-free and read-only through the panel consumer', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'host-real-media-curve-'));
@@ -143,7 +371,7 @@ describe('context curve image accounting at the panel boundary', () => {
       }
       expect(refs).toBe(3);
       const app = {
-        framework: { getAgent: () => ({ getContextManager: () => cm }) },
+        framework: { getAgent: () => ({ maxTokens: 64, getContextManager: () => cm }) },
         recipe: { agent: { contextBudgetTokens: 20_000, maxTokens: 64 } },
       } as unknown as PanelAppRef;
       const result = await buildContextCurve(app, 'root') as { totals: { rendered: number; rawCovered: number }; entries: Array<{ nImages: number }> };
@@ -207,7 +435,7 @@ describe('context curve image accounting at the panel boundary', () => {
         expect(selected).toHaveLength(1);
         expect(selected[0]).toMatchObject(legacy[1]);
         const app = {
-          framework: { getAgent: () => ({ getContextManager: () => cm }) },
+          framework: { getAgent: () => ({ maxTokens: 64, getContextManager: () => cm }) },
           recipe: { agent: { contextBudgetTokens: 20_000, maxTokens: 64 } },
         } as unknown as PanelAppRef;
         const result = await buildContextCurve(app, 'root') as {
@@ -247,11 +475,12 @@ describe('context curve image accounting at the panel boundary', () => {
     const placeholder = '[Image omitted by the configured live-image policy]';
     const result = await curve([[image('AA==', 731)], [image('AQID', 907)]], [{
       participant: 'user', content: [{ type: 'text', text: placeholder }, image('AQID', 907)],
-    }], [[0, 1]]);
+    }], [[0, 1]], 0.6);
     expect(result.entries).toHaveLength(1);
     expect(result.entries[0]).toMatchObject({
       kind: 'raw', nImages: 1,
-      rendered: defaultTokenEstimator(placeholder) + 907, rawCovered: 1638,
+      rendered: Math.round(defaultTokenEstimator(placeholder) * 0.6) + Math.round(907 * 0.6),
+      rawCovered: Math.round(731 * 0.6) + Math.round(907 * 0.6),
     });
   });
 
@@ -260,8 +489,8 @@ describe('context curve image accounting at the panel boundary', () => {
     const result = await curve([[image('AA==', 731), { type: 'text', text }]], [
       { participant: 'user', content: [image('AA==', 731)] },
       { participant: 'root', content: [{ type: 'text', text }] },
-    ], [[0], [0]]);
-    const original = 731 + defaultTokenEstimator(text);
+    ], [[0], [0]], 1.7);
+    const original = Math.round(731 * 1.7) + Math.round(defaultTokenEstimator(text) * 1.7);
     expect(result.totals).toMatchObject({ rendered: original, rawCovered: original });
     expect(result.entries.map(entry => entry.rawCovered)).toEqual([original, 0]);
   });
@@ -276,8 +505,14 @@ describe('context curve image accounting at the panel boundary', () => {
       const messages = new MessageStore(store);
       const sourceIds = [messages.append('user', [defaultImage]).id, messages.append('user', [nested]).id];
       const summaryText = 'A concise account of two observations';
+      const calibration = 1.7;
       const cm = {
-        compileMetadata: async () => ({ messages: [{ participant: 'root', content: [{ type: 'text', text: summaryText }] }] }),
+        compileMetadata: async () => ({
+          tokenCalibration: calibration,
+          estimatedTokens: messages.estimateContentTokens([{ type: 'text', text: summaryText }], calibration),
+          messages: [{ participant: 'root', content: [{ type: 'text', text: summaryText }] }],
+        }),
+        estimateContentTokens: messages.estimateContentTokens.bind(messages),
         getMessageCount: () => messages.length(),
         getMessageWindow: (offset: number, limit: number, options: { resolveBlobs?: boolean }) => {
           expect(options.resolveBlobs).toBe(false);
@@ -290,12 +525,13 @@ describe('context curve image accounting at the panel boundary', () => {
         currentBranch: () => ({ name: 'main' }),
       };
       store.getBlob = () => { throw new Error('summary curve resolved archived media'); };
-      const app = { framework: { getAgent: () => ({ getContextManager: () => cm }) }, recipe: { agent: {} } } as unknown as PanelAppRef;
+      const app = { framework: { getAgent: () => ({ maxTokens: 4096, getContextManager: () => cm }) }, recipe: { agent: {} } } as unknown as PanelAppRef;
       const result = await buildContextCurve(app, 'root') as { entries: Array<{ kind: string; rendered: number; rawCovered: number; nImages: number; msgCount: number }> };
       expect(result.entries).toHaveLength(1);
       expect(result.entries[0]).toMatchObject({
-        kind: 'L2', rendered: defaultTokenEstimator(summaryText),
-        rawCovered: 1600 + 2103 + defaultTokenEstimator('Tool observation'), nImages: 0, msgCount: 2,
+        kind: 'L2', rendered: Math.round(defaultTokenEstimator(summaryText) * calibration),
+        rawCovered: Math.round(1600 * calibration) + Math.round((2103 + defaultTokenEstimator('Tool observation')) * calibration),
+        nImages: 0, msgCount: 2,
       });
     } finally {
       store.close();
