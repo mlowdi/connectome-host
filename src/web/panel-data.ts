@@ -19,7 +19,7 @@
  */
 
 import type { AgentFramework } from '@animalabs/agent-framework';
-import { NativeFormatter, AnthropicXmlFormatter } from '@animalabs/membrane';
+import { NativeFormatter, AnthropicXmlFormatter, isVisualImageContent, isImageReference, normalizeImageContent, asImageContent } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedMessage, ToolDefinition } from '@animalabs/membrane';
 import type { Recipe } from '../recipe.js';
 import type { CallLedger } from '../call-ledger.js';
@@ -224,23 +224,22 @@ export function buildMediaBlock(
   const agent = requireAgent(app, agentName);
   const messageId = typeof params.messageId === 'string' ? params.messageId : '';
   const path = typeof params.path === 'string' ? params.path : '';
-  if (!messageId || !/^\d{1,4}(\.\d{1,4})?$/.test(path)) {
+  if (!messageId || !/^\d{1,4}(\.\d{1,4})*$/.test(path)) {
     throw new PanelError('media: messageId and block path (<n> or <n>.<m>) are required', 400);
   }
   const cm = agent.getContextManager() as unknown as MediaReadableCm;
   const content = readInflatedContent(cm, messageId);
   if (!content) throw new PanelError(`message not found on the active branch: ${messageId}`, 404);
-  const [outer, inner] = path.split('.').map(Number);
+  const [outer, ...nestedPath] = path.split('.').map(Number);
   let block = content[outer] as Record<string, unknown> | undefined;
-  if (inner !== undefined) {
+  for (const inner of nestedPath) {
     const nested = block?.type === 'tool_result' && Array.isArray(block.content) ? block.content : null;
     block = nested ? (nested[inner] as Record<string, unknown> | undefined) : undefined;
   }
-  const b = block as
-    | { type?: string; source?: { type?: string; data?: unknown; mediaType?: unknown } }
-    | undefined;
-  if (!b || b.type !== 'image') throw new PanelError(`no image block at ${path}`, 404);
-  const src = b.source;
+  if (!isVisualImageContent(block)) throw new PanelError(`no image block at ${path}`, 404);
+  const visual = block.type === 'generated_image' ? normalizeImageContent(block as unknown as Record<string, unknown>) : block;
+  if (!isVisualImageContent(visual)) throw new PanelError('image is unavailable or rejected', 404);
+  const src = asImageContent(visual).source;
   if (src?.type !== 'base64' || typeof src.data !== 'string' || typeof src.mediaType !== 'string') {
     throw new PanelError('image is not inline (reference-only or stripped)', 404);
   }
@@ -1116,7 +1115,7 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
 function countMetadataImages(content: readonly StoredContentBlock[]): number {
   let count = 0;
   for (const block of content) {
-    if (block.type === 'image' || (block.type === 'blob_ref' && block.ref.originalType === 'image')) {
+    if (isVisualImageContent(block) || isImageReference(block)) {
       count++;
     } else if (block.type === 'tool_result' && Array.isArray(block.content)) {
       count += countMetadataImages(block.content);
@@ -1242,12 +1241,15 @@ function projectDryEntries(result: unknown): unknown {
     const blocks = Array.isArray(o.content) ? o.content : [];
     for (const b of blocks) {
       if (!b || typeof b !== 'object') { text += String(b ?? ''); continue; }
-      const t = (b as { type?: string }).type;
-      if (t === 'text') text += (b as { text?: string }).text ?? '';
-      else if (t === 'image') { media++; text += '[image]'; }
+      const t = 'type' in b ? b.type : undefined;
+      if (t === 'text') text += 'text' in b && typeof b.text === 'string' ? b.text : '';
+      else if (isVisualImageContent(b) || isImageReference(b)) { media++; text += '[image]'; }
       else if (t === 'thinking' || t === 'redacted_thinking') text += '[thinking]';
-      else if (t === 'tool_use') text += `[tool_use ${(b as { name?: string }).name ?? ''}]`;
-      else if (t === 'tool_result') text += '[tool_result]';
+      else if (t === 'tool_use') text += `[tool_use ${'name' in b && typeof b.name === 'string' ? b.name : ''}]`;
+      else if (t === 'tool_result') {
+        text += '[tool_result]';
+        if ('content' in b && Array.isArray(b.content)) media += countMetadataImages(b.content);
+      }
     }
     if (typeof o.content === 'string') text = o.content;
     return {

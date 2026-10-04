@@ -20,6 +20,7 @@
  * for the deployment story.
  */
 
+import { isVisualImageContent, isImageReference } from '@animalabs/membrane';
 import { CURVE_PAGE_HTML } from './web-ui-curve-page.js';
 import { RETRIEVAL_TRACE_PAGE_HTML } from './retrieval-trace-page.js';
 import type { RetrievalTraceSource } from './retrieval-trace.js';
@@ -3298,26 +3299,48 @@ function capText(s: string, cap: number): { text: string; truncated?: boolean } 
 function toWireEntry(
   msg: MessageLike,
   index: number,
-  opts: { mediaRefs?: boolean } = {},
+  mediaOrigins?: readonly { messageId?: string; blockIndex: number }[],
 ): WelcomeMessageEntry {
   const blocks: import('../web/protocol.js').MessageBlock[] = [];
   const textParts: string[] = [];
   let toolResults = 0;
   let conversational = 0; // text/thinking blocks — used for participant fixup
-  // Lazy image locator: `<messageId>/<blockIndex>[.<inner>]`, served by
-  // /media/. Only when the entry maps 1:1 onto one stored message (coalesced
-  // shard runs do not — their block indices are synthetic).
-  const mediaRef = (blockPath: string, mediaType: string): string | undefined =>
-    opts.mediaRefs !== false && typeof msg.id === 'string' && msg.id.length > 0 && mediaType.startsWith('image/')
-      ? `${encodeURIComponent(msg.id)}/${blockPath}`
-      : undefined;
+  // Coalesced presentation indices are synthetic; locators always address
+  // the original stored message and original top-level/nested block path.
+  const mediaRef = (blockPath: string, mediaType: string): string | undefined => {
+    if (!mediaType.startsWith('image/')) return undefined;
+    const dot = mediaOrigins ? blockPath.indexOf('.') : -1;
+    const origin = mediaOrigins?.[Number(dot < 0 ? blockPath : blockPath.slice(0, dot))];
+    const messageId = origin ? origin.messageId : msg.id;
+    if (typeof messageId !== 'string' || messageId.length === 0) return undefined;
+    const path = origin ? `${origin.blockIndex}${dot < 0 ? '' : blockPath.slice(dot)}` : blockPath;
+    return `${encodeURIComponent(messageId)}/${path}`;
+  };
+
+  const appendNestedMedia = (content: unknown[], prefix: string): void => {
+    for (const [index, inner] of content.entries()) {
+      const block = inner as { type?: string; content?: unknown; source?: { mediaType?: unknown };
+        mimeType?: unknown; ref?: { mediaType?: unknown } } | null;
+      const path = `${prefix}.${index}`;
+      if (block?.type === 'tool_result' && Array.isArray(block.content)) {
+        appendNestedMedia(block.content, path);
+        continue;
+      }
+      const mediaType = block?.type === 'generated_image' && typeof block.mimeType === 'string' ? block.mimeType
+        : block?.type === 'image' && typeof block.source?.mediaType === 'string' ? block.source.mediaType
+        : block?.type === 'blob_ref' && typeof block.ref?.mediaType === 'string' ? block.ref.mediaType : null;
+      if (!mediaType?.startsWith('image/')) continue;
+      const ref = mediaRef(path, mediaType);
+      blocks.push({ kind: 'media', mediaType, ...(ref ? { ref } : {}) });
+    }
+  };
 
   for (const [bi, block] of msg.content.entries()) {
     const b = block as {
       type?: string; text?: unknown; thinking?: unknown; data?: unknown;
       id?: unknown; name?: unknown; input?: unknown;
       toolUseId?: unknown; content?: unknown; isError?: unknown;
-      source?: { mediaType?: unknown }; mediaType?: unknown;
+      source?: { mediaType?: unknown }; mediaType?: unknown; mimeType?: unknown;
       ref?: { mediaType?: unknown };
     };
     switch (b.type) {
@@ -3369,28 +3392,20 @@ function toWireEntry(
           toolResults++;
           // Images a tool returned (read_image, cameras, screenshots) ride as
           // sibling media blocks with a nested locator so they render inline.
-          if (Array.isArray(b.content)) {
-            for (const [ii, inner] of b.content.entries()) {
-              const ib = inner as { type?: string; source?: { mediaType?: unknown }; ref?: { mediaType?: unknown } } | null;
-              const mt = ib?.type === 'image' && typeof ib.source?.mediaType === 'string' ? ib.source.mediaType
-                : ib?.type === 'blob_ref' && typeof ib.ref?.mediaType === 'string' ? ib.ref.mediaType
-                : null;
-              if (!mt || !mt.startsWith('image/')) continue;
-              const ref = mediaRef(`${bi}.${ii}`, mt);
-              blocks.push({ kind: 'media', mediaType: mt, ...(ref ? { ref } : {}) });
-            }
-          }
+          if (Array.isArray(b.content)) appendNestedMedia(b.content, String(bi));
         }
         break;
       case 'image':
+      case 'generated_image':
       case 'document':
       case 'audio':
       case 'video': {
         const mediaType =
-          typeof b.source?.mediaType === 'string' ? b.source.mediaType
+          b.type === 'generated_image' && typeof b.mimeType === 'string' ? b.mimeType
+          : typeof b.source?.mediaType === 'string' ? b.source.mediaType
           : typeof b.mediaType === 'string' ? b.mediaType
           : b.type;
-        const ref = b.type === 'image' ? mediaRef(String(bi), mediaType) : undefined;
+        const ref = isVisualImageContent(b) ? mediaRef(String(bi), mediaType) : undefined;
         blocks.push({ kind: 'media', mediaType, ...(ref ? { ref } : {}) });
         break;
       }
@@ -3433,9 +3448,10 @@ function flattenToolResultContent(content: unknown): string {
   if (!Array.isArray(content)) return content == null ? '' : String(content);
   const parts: string[] = [];
   for (const block of content) {
-    const b = block as { type?: string; text?: unknown };
+    const b = block as { type?: string; text?: unknown; content?: unknown };
     if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
-    else if (b.type === 'image') parts.push('[image]');
+    else if (b.type === 'tool_result') parts.push(flattenToolResultContent(b.content));
+    else if (isVisualImageContent(b) || isImageReference(b)) parts.push('[image]');
     else if (typeof b.type === 'string') parts.push(`[${b.type}]`);
   }
   return parts.join('\n');
@@ -3467,18 +3483,23 @@ function coalesceAndFlatten(messages: readonly MessageLike[], startIndex: number
     // Merge adjacent text blocks with NO separator — shard cuts land
     // mid-text, so reassembly must be byte-faithful concatenation.
     const mergedContent: unknown[] = [];
-    for (const blk of shards.flatMap((s) => [...s.content])) {
-      const prev = mergedContent[mergedContent.length - 1] as { type?: string; text?: string } | undefined;
-      const cur = blk as { type?: string; text?: unknown };
-      if (prev?.type === 'text' && cur.type === 'text'
-          && typeof prev.text === 'string' && typeof cur.text === 'string') {
-        mergedContent[mergedContent.length - 1] = { type: 'text', text: prev.text + cur.text };
-      } else {
-        mergedContent.push(blk);
+    const mediaOrigins: Array<{ messageId?: string; blockIndex: number }> = [];
+    for (const shard of shards) {
+      for (let blockIndex = 0; blockIndex < shard.content.length; blockIndex++) {
+        const blk = shard.content[blockIndex];
+        const prev = mergedContent[mergedContent.length - 1];
+        if (prev && typeof prev === 'object' && 'type' in prev && prev.type === 'text' &&
+            'text' in prev && typeof prev.text === 'string' && blk && typeof blk === 'object' &&
+            'type' in blk && blk.type === 'text' && 'text' in blk && typeof blk.text === 'string') {
+          mergedContent[mergedContent.length - 1] = { type: 'text', text: prev.text + blk.text };
+        } else {
+          mergedContent.push(blk);
+          mediaOrigins.push({ messageId: shard.id, blockIndex });
+        }
       }
     }
     const merged: MessageLike = { ...shards[0]!, content: mergedContent };
-    out.push(toWireEntry(merged, startIndex + runStart, { mediaRefs: false }));
+    out.push(toWireEntry(merged, startIndex + runStart, mediaOrigins));
   }
   return out;
 }

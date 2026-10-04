@@ -1,4 +1,5 @@
 import { defaultTokenEstimator, jsonTokenEstimator, MessageStore } from '@animalabs/context-manager';
+import { IMAGE_TOKEN_ESTIMATE, isImageReference } from '@animalabs/membrane';
 
 export interface ContentEstimate {
   tokens: number;
@@ -35,13 +36,14 @@ function addBlock(block: unknown, estimate: ContentEstimate): void {
       }
       break;
     case 'image':
-      estimate.tokens += typeof b.tokenEstimate === 'number' ? b.tokenEstimate : 1600;
+    case 'generated_image':
+      estimate.tokens += typeof b.tokenEstimate === 'number' ? b.tokenEstimate : IMAGE_TOKEN_ESTIMATE;
       estimate.nImages++;
       break;
     case 'blob_ref': {
       const ref = b.ref as { originalType?: string } | undefined;
-      if (ref?.originalType === 'image') {
-        estimate.tokens += typeof b.tokenEstimate === 'number' ? b.tokenEstimate : 1600;
+      if (isImageReference(b)) {
+        estimate.tokens += typeof b.tokenEstimate === 'number' ? b.tokenEstimate : IMAGE_TOKEN_ESTIMATE;
         estimate.nImages++;
       } else if (ref?.originalType === 'document' || ref?.originalType === 'audio' || ref?.originalType === 'video') {
         estimate.tokens += 1000;

@@ -428,6 +428,50 @@ describe('live agent response reserves in context diagnostics', () => {
       clock.mockRestore();
     }
   });
+  test('falsifier: rendered preview counts direct and nested generated metadata without blob hydration', async () => {
+    const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+    const dir = mkdtempSync(join(tmpdir(), 'host-generated-preview-'));
+    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new Membrane(new MockAdapter()),
+      agents: [{ name: 'fixture', model: 'unused-no-model', systemPrompt: '', strategy: new AutobiographicalStrategy({
+        headWindowTokens: 0, recentWindowTokens: 200, targetChunkTokens: 100, adaptiveResolution: true,
+        autoTickOnNewMessage: false, maxLiveImages: 0, maxLiveImageBytes: 0, imageStripDepthTokens: 0,
+      }) }], modules: [], syncIntervalMs: 0 });
+    const cm = framework.getAgent('fixture')!.getContextManager();
+    const store = cm.getStore();
+    const getBlob = store.getBlob.bind(store);
+    const clock = spyOn(Date, 'now').mockImplementation(() => previewClock);
+    try {
+      cm.addMessage('fixture', [{ type: 'tool_use', id: 'nested', name: 'fixture', input: {} }]);
+      cm.addMessage('user', [{ type: 'text', text: 'before' },
+        { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' }, tokenEstimate: 731 },
+        { type: 'generated_image', data: PNG, mimeType: 'image/png', tokenEstimate: 731 },
+        { type: 'tool_result', toolUseId: 'nested', content: [{ type: 'generated_image', data: PNG, mimeType: 'image/png', tokenEstimate: 0 }] },
+        { type: 'text', text: 'after' }]);
+      const before = store.currentSequence();
+      let reads = 0;
+      store.getBlob = hash => { reads++; return getBlob(hash); };
+      const app = { framework, recipe: { agent: { name: 'fixture', contextBudgetTokens: 100000, maxTokens: 64 } } } as unknown as PanelAppRef;
+      previewClock += 3001;
+      const result = runContextPreview(app, 'fixture', { budget: 100000, render: true });
+      const preview = result.preview;
+      if (!preview || typeof preview !== 'object' || !('entries' in preview) || !Array.isArray(preview.entries)) {
+        throw new Error('actual feasible preview did not return rendered entries');
+      }
+      const media = preview.entries.reduce((sum, entry: unknown) => {
+        if (!entry || typeof entry !== 'object' || !('media' in entry) || typeof entry.media !== 'number') throw new Error('invalid media count');
+        return sum + entry.media;
+      }, 0);
+      expect(media).toBe(3);
+      expect(JSON.stringify(result)).not.toContain(PNG);
+      expect(reads).toBe(0);
+      expect(store.currentSequence()).toBe(before);
+    } finally {
+      clock.mockRestore();
+      store.getBlob = getBlob;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('context curve snapshot calibration parity', () => {
