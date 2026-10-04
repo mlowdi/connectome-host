@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
-import { ContextManager, AutobiographicalStrategy, MessageStore, defaultTokenEstimator, jsonTokenEstimator } from '@animalabs/context-manager';
+import { ContextManager, AutobiographicalStrategy, WindowedPassthroughStrategy, MessageStore, defaultTokenEstimator, jsonTokenEstimator } from '@animalabs/context-manager';
+import type { MetadataCompileResultWithProvenance, SummaryEntry, TokenBudget } from '@animalabs/context-manager';
 import { Agent, AgentFramework } from '@animalabs/agent-framework';
 import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, ImageContent } from '@animalabs/membrane';
@@ -26,8 +27,8 @@ function withMessageStore<T>(run: (messages: MessageStore, store: JsStore) => T)
   }
 }
 
-// The panel really reads Chronicle's unresolved message window; only selection
-// of the already-compiled window is a fixture. No model or archive reads occur.
+// Only selection is a fixture: the typed snapshot prices referenced Chronicle
+// originals synchronously. Post-selection live reads fail rather than mask races.
 async function curve(content: ContentBlock[][], selected: Array<{ participant: string; content: ContentBlock[] }>, sourceGroups?: number[][], calibration = 1) {
   const dir = mkdtempSync(join(tmpdir(), 'host-media-curve-'));
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
@@ -35,22 +36,29 @@ async function curve(content: ContentBlock[][], selected: Array<{ participant: s
   const messages = new MessageStore(store);
   const ids = content.map(blocks => messages.append('user', blocks).id);
   const cm = {
-    compileMetadata: async () => ({
-      tokenCalibration: calibration,
-      estimatedTokens: selected.reduce((sum, entry) => sum + messages.estimateContentTokens(entry.content, calibration), 0),
-      messages: selected.map((entry, i) => ({
-        ...entry,
-        ...(sourceGroups ? { sourceMessageIds: sourceGroups[i].map(index => ids[index]) } : { sourceMessageId: ids[i] }),
-      })),
-    }),
-    estimateContentTokens: messages.estimateContentTokens.bind(messages),
-    getMessageCount: () => messages.length(),
-    getMessageWindow: (offset: number, limit: number, options: { resolveBlobs?: boolean }) => {
-      expect(options.resolveBlobs).toBe(false);
-      return messages.getWindow(offset, limit, options);
+    compileMetadata: async (_budget: TokenBudget, options: { provenance: true }): Promise<MetadataCompileResultWithProvenance> => {
+      expect(options).toEqual({ provenance: true });
+      const entries = selected.map((entry, i) => ({
+        renderedTokens: messages.estimateContentTokens(entry.content, calibration),
+        sourceMessageIds: sourceGroups ? sourceGroups[i].map(index => ids[index]) : [ids[i]],
+        sourceSummaryIds: [], summaryLevel: null,
+      }));
+      const view = messages.createMetadataView();
+      const sources = [...new Set(entries.flatMap(entry => entry.sourceMessageIds))].map(id => {
+        const source = view.get(id)!;
+        return { id, tokens: messages.estimateContentTokens(source.content, calibration), timestamp: new Date(source.timestamp) };
+      });
+      const branch = store.currentBranch();
+      return { tokenCalibration: calibration, estimatedTokens: entries.reduce((sum, entry) => sum + entry.renderedTokens, 0),
+        messages: selected.map((entry, i) => ({ ...entry,
+          ...(sourceGroups ? { sourceMessageIds: [...entries[i].sourceMessageIds] } : { sourceMessageId: ids[i] }),
+        })), provenance: { branch: { id: branch.id, name: branch.name, head: branch.head }, entries, sources } };
     },
-    getStrategy: () => ({}),
-    currentBranch: () => ({ name: 'main' }),
+    estimateContentTokens: () => { throw new Error('curve repriced after snapshot'); },
+    getMessageCount: () => { throw new Error('curve read live count'); },
+    getMessageWindow: () => { throw new Error('curve read live history'); },
+    getStrategy: () => { throw new Error('curve read live summaries'); },
+    currentBranch: () => { throw new Error('curve read live branch'); },
   };
   const app = {
     framework: { getAgent: () => ({ maxTokens: 4096, getContextManager: () => cm }), getAgentRuntimeSettings: () => ({ contextBudgetTokens: 123_456 }) },
@@ -69,6 +77,191 @@ async function curve(content: ContentBlock[][], selected: Array<{ participant: s
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+function curveApp(cm: unknown, maxTokens = 20000, reserveForResponse = 2000): PanelAppRef {
+  return { framework: { getAgent: () => ({ maxTokens: reserveForResponse, getContextManager: () => cm }),
+    getAgentRuntimeSettings: () => ({ contextBudgetTokens: maxTokens }) }, recipe: { agent: {} } } as unknown as PanelAppRef;
+}
+
+function holdCurveSelection(cm: ContextManager) {
+  let release!: () => void;
+  let ready!: (result: MetadataCompileResultWithProvenance) => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const selected = new Promise<MetadataCompileResultWithProvenance>(resolve => { ready = resolve; });
+  const facade = {
+    compileMetadata: async (budget: TokenBudget, options: { provenance: true }): Promise<MetadataCompileResultWithProvenance> => {
+      expect(options).toEqual({ provenance: true });
+      const result = await cm.compileMetadata(budget, options);
+      ready(result);
+      await gate;
+      return result;
+    },
+    getMessageCount: () => { throw new Error('post-selection live count'); },
+    getMessageWindow: () => { throw new Error('post-selection live history'); },
+    getStrategy: () => { throw new Error('post-selection live strategy'); },
+    currentBranch: () => { throw new Error('post-selection live branch'); },
+    estimateContentTokens: () => { throw new Error('post-selection live price'); },
+  };
+  return { selected, release, facade };
+}
+
+type CurveSnapshot = {
+  branch: string;
+  totals: { rendered: number; rawCovered: number };
+  entries: Array<{ kind: string; id: string | null; text: string; rendered: number; rawCovered: number;
+    msgCount: number; nImages: number; dateFirst: Date | null; dateLast: Date | null }>;
+};
+
+class CurveSummaryStrategy extends AutobiographicalStrategy {
+  seedSummary(entry: SummaryEntry): void { this.pushSummary(entry); }
+}
+
+describe('real same-selection context curve snapshots', () => {
+  for (const mutation of ['edit', 'branch'] as const) {
+    test(`holds old branch/content/prices/dates while awaiting a real ${mutation}`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'host-curve-snapshot-race-'));
+      const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new AutobiographicalStrategy({
+        headWindowTokens: 0, recentWindowTokens: 100000, targetChunkTokens: 100000,
+        adaptiveResolution: true, autoTickOnNewMessage: false,
+        maxLiveImages: 0, maxLiveImageBytes: 0, imageStripDepthTokens: 0,
+      }) });
+      try {
+        const id = cm.addMessage('User', [{ type: 'text', text: 'x'.repeat(400) }]);
+        const store = cm.getStore();
+        const main = cm.currentBranch().name;
+        if (mutation === 'branch') {
+          store.createBranch('curve-side');
+          await cm.switchBranch('curve-side');
+          cm.editMessage(id, [{ type: 'text', text: 'y'.repeat(4000) }]);
+          await cm.switchBranch(main);
+        }
+        const oldDate = cm.getMessage(id)!.timestamp;
+        const held = holdCurveSelection(cm);
+        const pending = buildContextCurve(curveApp(held.facade), 'root');
+        const captured = await held.selected;
+        if (mutation === 'edit') cm.editMessage(id, [{ type: 'text', text: 'y'.repeat(4000) }]);
+        else await cm.switchBranch('curve-side');
+        const sequence = store.currentSequence();
+        const stats = cm.getRenderStats();
+        const work = cm.getPendingWork();
+        store.getBlob = () => { throw new Error('curve resolved a blob'); };
+        held.release();
+        const result = await pending as CurveSnapshot;
+        expect(result.branch).toBe(main);
+        expect(result.entries[0].text).toBe('x'.repeat(400));
+        expect(result.entries[0].dateFirst).toEqual(oldDate);
+        expect(result.totals.rendered).toBe(captured.estimatedTokens);
+        expect(result.totals.rawCovered).toBe(captured.provenance.sources[0].tokens);
+        expect(store.currentSequence()).toBe(sequence);
+        expect(cm.getRenderStats()).toEqual(stats);
+        expect(cm.getPendingWork()).toEqual(work);
+        const newer = await buildContextCurve(curveApp(cm), 'root') as CurveSnapshot;
+        expect(newer.entries[0].text).toBe('y'.repeat(4000));
+        expect(newer.totals.rawCovered).toBeGreaterThan(result.totals.rawCovered);
+        expect(newer.branch).toBe(mutation === 'branch' ? 'curve-side' : main);
+      } finally { cm.close(); rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+
+  test('stripped auxiliary base64 is rendered19 but retains its original948 coverage', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'host-curve-auxiliary-'));
+    const writer = await ContextManager.open({ path: join(dir, 'store'), strategy: new WindowedPassthroughStrategy() });
+    const reader = await ContextManager.open({ store: writer.getStore(), namespace: 'subconscious/primary',
+      isolate: true, auxiliaryMessageViews: [{}], strategy: new AutobiographicalStrategy({
+        headWindowTokens: 0, recentWindowTokens: 100000, targetChunkTokens: 100000, adaptiveResolution: true,
+        autoTickOnNewMessage: false, maxLiveImages: 1, maxLiveImageBytes: 1, imageStripDepthTokens: 100000,
+      }) });
+    try {
+      const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+      const id = writer.addMessage('User', [{ type: 'text', text: 'auxiliary original' }, image(png, 941)]);
+      const timestamp = writer.getMessageWindow(0, writer.getMessageCount(), { resolveBlobs: false }).messages[0].timestamp;
+      const store = writer.getStore();
+      const sequence = store.currentSequence();
+      store.getBlob = () => { throw new Error('auxiliary curve resolved an image'); };
+      const result = await buildContextCurve(curveApp(reader), 'Subconscious') as CurveSnapshot;
+      expect(reader.getMessageCount()).toBe(0);
+      expect(result.entries).toHaveLength(1);
+      expect(result.entries[0]).toMatchObject({ id, rendered: 19, rawCovered: 948, nImages: 0,
+        dateFirst: timestamp, dateLast: timestamp });
+      expect(result.totals).toMatchObject({ rendered: 19, rawCovered: 948 });
+      expect(store.currentSequence()).toBe(sequence);
+    } finally { reader.close(); writer.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  for (const mode of ['adaptive', 'positioned', 'combined'] as const) {
+    test(`${mode} answers keep exact summary/auxiliary leaf identity across await`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'host-curve-summary-snapshot-'));
+      const writer = await ContextManager.open({ path: join(dir, 'store'), strategy: new WindowedPassthroughStrategy() });
+      const strategy = new CurveSummaryStrategy({ headWindowTokens: 0, recentWindowTokens: 8,
+        targetChunkTokens: 100000, autoTickOnNewMessage: false, adaptiveResolution: mode === 'adaptive',
+        positionedRecallPairs: mode !== 'combined', recallHeaderTemplate: 'Identical custom header',
+        summaryContextLabel: 'Identical custom header', maxLiveImages: 1, maxLiveImageBytes: 1, imageStripDepthTokens: 100000 });
+      const reader = await ContextManager.open({ store: writer.getStore(), namespace: 'subconscious/summary',
+        isolate: true, auxiliaryMessageViews: [{}], strategy });
+      try {
+        const ids = [0, 1, 2, 3].map(i => (i % 2 ? reader : writer).addMessage('user',
+          [{ type: 'text', text: ('raw-' + i + ' ').repeat(180) }]));
+        reader.addMessage('user', [{ type: 'text', text: 'latest ' + 'Z'.repeat(60) }]);
+        const seed = (id: string, level: number, sourceLevel: number, sourceIds: string[], range: string[],
+          extra: Partial<SummaryEntry> = {}) => strategy.seedSummary({ id, level, sourceLevel, sourceIds,
+          sourceRange: { first: range[0], last: range.at(-1)! }, created: 0,
+          content: 'Same prefix '.repeat(12) + id, tokens: 45, ...extra });
+        seed('L1-0', 1, 0, [ids[0]], [ids[0]], { mergedInto: 'L2-100', parentId: 'L2-100' });
+        seed('L1-1', 1, 0, [ids[1]], [ids[1]], { mergedInto: 'L2-100', parentId: 'L2-100' });
+        seed('L2-100', 2, 1, ['L1-0', 'L1-1'], ids.slice(0, 2));
+        seed('L1-101', 1, 0, [ids[2]], [ids[2]]);
+        seed('L1-102', 1, 0, [ids[3]], [ids[3]]);
+        const held = holdCurveSelection(reader);
+        const pending = buildContextCurve(curveApp(held.facade, mode === 'adaptive' ? 600 : 20000, 0), 'Subconscious');
+        const captured = await held.selected;
+        const capturedBranch = { ...captured.provenance.branch };
+        strategy.getSummary('L2-100')!.sourceIds.splice(0, 2, 'L1-102');
+        const store = writer.getStore();
+        const sequence = store.currentSequence();
+        store.getBlob = () => { throw new Error('summary curve opened an archive'); };
+        held.release();
+        const result = await pending as CurveSnapshot;
+        const answers = result.entries.filter(entry => entry.kind !== 'raw');
+        if (mode === 'combined') {
+          expect(answers).toHaveLength(1);
+          expect(answers[0]).toMatchObject({ kind: 'L2', id: 'L2-100', msgCount: 4 });
+        } else {
+          expect(answers.map(answer => answer.id)).toEqual(mode === 'adaptive'
+            ? ['L2-100', 'L1-101'] : ['L2-100', 'L1-101', 'L1-102']);
+          expect(answers[0]).toMatchObject({ kind: 'L2', msgCount: 2 });
+        }
+        expect(result.totals.rendered).toBe(captured.estimatedTokens);
+        const scaffolding = captured.provenance.entries.filter(row => row.summaryLevel === null && !row.sourceMessageIds.length)
+          .reduce((sum, row) => sum + row.renderedTokens, 0);
+        expect(result.totals.rawCovered).toBe(captured.provenance.sources.reduce((sum, row) => sum + row.tokens, scaffolding));
+        expect(result.branch).toBe(capturedBranch.name);
+        expect(store.currentSequence()).toBe(sequence);
+        result.entries.forEach((entry, i) => expect(entry.rendered).toBe(captured.provenance.entries[i].renderedTokens));
+      } finally { reader.close(); writer.close(); rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+
+  test('unavailable originals and generated scaffolding retain distinct explicit fallbacks', async () => {
+    const content: ContentBlock[] = [{ type: 'text', text: 'unavailable or generated' }];
+    const snapshot: MetadataCompileResultWithProvenance = {
+      messages: [{ participant: 'user', content, sourceMessageId: 'removed' }, { participant: 'root', content },
+        { participant: 'Context Manager', content }], tokenCalibration: 1.7, estimatedTokens: 30,
+      provenance: { branch: { id: 'captured-branch-id', name: 'captured-name', head: 123 }, sources: [],
+        entries: [{ renderedTokens: 7, sourceMessageIds: ['removed'], sourceSummaryIds: [], summaryLevel: null },
+          { renderedTokens: 9, sourceMessageIds: ['removed'], sourceSummaryIds: ['L2-missing-leaves'], summaryLevel: 2 },
+          { renderedTokens: 14, sourceMessageIds: [], sourceSummaryIds: [], summaryLevel: null }] },
+    };
+    const cm = { compileMetadata: async (_budget: TokenBudget, options: { provenance: true }) => {
+      expect(options).toEqual({ provenance: true }); return snapshot;
+    } };
+    const result = await buildContextCurve(curveApp(cm), 'root') as CurveSnapshot;
+    expect(result.entries.map(entry => [entry.kind, entry.rawCovered, entry.msgCount])).toEqual([
+      ['raw', 7, 1], ['L2', 0, 0], ['raw', 14, 1],
+    ]);
+    expect(result.entries.every(entry => entry.dateFirst === null && entry.dateLast === null)).toBe(true);
+    expect(result.totals).toMatchObject({ rendered: 30, rawCovered: 21 });
+  });
+});
 
 describe('host semantic content accounting', () => {
   test('base64 size is irrelevant for top-level and deeply nested images', () => {
@@ -507,22 +700,27 @@ describe('context curve image accounting at the panel boundary', () => {
       const summaryText = 'A concise account of two observations';
       const calibration = 1.7;
       const cm = {
-        compileMetadata: async () => ({
-          tokenCalibration: calibration,
-          estimatedTokens: messages.estimateContentTokens([{ type: 'text', text: summaryText }], calibration),
-          messages: [{ participant: 'root', content: [{ type: 'text', text: summaryText }] }],
-        }),
-        estimateContentTokens: messages.estimateContentTokens.bind(messages),
-        getMessageCount: () => messages.length(),
-        getMessageWindow: (offset: number, limit: number, options: { resolveBlobs?: boolean }) => {
-          expect(options.resolveBlobs).toBe(false);
-          return messages.getWindow(offset, limit, options);
+        compileMetadata: async (_budget: TokenBudget, options: { provenance: true }): Promise<MetadataCompileResultWithProvenance> => {
+          expect(options).toEqual({ provenance: true });
+          const content: ContentBlock[] = [{ type: 'text', text: summaryText }];
+          const renderedTokens = messages.estimateContentTokens(content, calibration);
+          const view = messages.createMetadataView();
+          const branch = store.currentBranch();
+          return { tokenCalibration: calibration, estimatedTokens: renderedTokens,
+            messages: [{ participant: 'root', content }], provenance: {
+              branch: { id: branch.id, name: branch.name, head: branch.head },
+              entries: [{ renderedTokens, sourceMessageIds: [...sourceIds], sourceSummaryIds: ['L2-a'], summaryLevel: 2 }],
+              sources: sourceIds.map(id => {
+                const source = view.get(id)!;
+                return { id, tokens: messages.estimateContentTokens(source.content, calibration), timestamp: new Date(source.timestamp) };
+              }),
+            } };
         },
-        getStrategy: () => ({ summaries: [
-          { id: 'L1-a', level: 1, content: 'Earlier synopsis', sourceLevel: 0, sourceIds },
-          { id: 'L2-a', level: 2, content: summaryText, sourceLevel: 1, sourceIds: ['L1-a'] },
-        ] }),
-        currentBranch: () => ({ name: 'main' }),
+        estimateContentTokens: () => { throw new Error('summary curve repriced live'); },
+        getMessageCount: () => { throw new Error('summary curve read live count'); },
+        getMessageWindow: () => { throw new Error('summary curve read live history'); },
+        getStrategy: () => { throw new Error('summary curve read live summaries'); },
+        currentBranch: () => { throw new Error('summary curve read live branch'); },
       };
       store.getBlob = () => { throw new Error('summary curve resolved archived media'); };
       const app = { framework: { getAgent: () => ({ maxTokens: 4096, getContextManager: () => cm }) }, recipe: { agent: {} } } as unknown as PanelAppRef;

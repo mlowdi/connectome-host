@@ -1154,82 +1154,46 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
     if (typeof live === 'number' && live > 0) maxTokens = live;
   } catch { /* keep the recipe fallback */ }
   const reserveForResponse = agent.maxTokens;
-  const compiled = await cm.compileMetadata({ maxTokens, reserveForResponse });
-
-  // Curve inspection only needs text and source metadata. Resolving every
-  // historical blob here re-inlines all base64 media and can expand a
-  // few-hundred-MB Chronicle into several GB of JS heap. Use the windowed
-  // reader with blob resolution disabled so production diagnostics stay
-  // bounded by text history rather than the media archive.
-  const messageCount = cm.getMessageCount();
-  const messages: Array<{ id: string; timestamp?: unknown; content?: (ContentBlock | StoredContentBlock)[] }> =
-    cm.getMessageWindow(0, messageCount, { resolveBlobs: false }).messages;
-  const msgById = new Map(messages.map((mm) => [mm.id, mm]));
-
-  type Summary = { id: string; level: number; content: string; sourceLevel: number; sourceIds: string[] };
-  const strategy = cm.getStrategy() as { summaries?: Summary[] };
-  const sums: Summary[] = strategy.summaries ?? [];
-  const sumById = new Map(sums.map((x) => [x.id, x]));
-  const headOf = (txt: string): string => txt.replace(/\s+/g, ' ').slice(0, 100);
-  const byHead = new Map(sums.map((x) => [headOf(x.content), x]));
-  const leaves = (x: Summary, seen = new Set<string>()): string[] => {
-    if (seen.has(x.id)) return [];
-    seen.add(x.id);
-    if (x.sourceLevel === 0) return x.sourceIds;
-    const out: string[] = [];
-    for (const cid of x.sourceIds) {
-      const c = sumById.get(cid);
-      if (c) out.push(...leaves(c, seen));
-    }
-    return out;
-  };
+  const compiled = await cm.compileMetadata({ maxTokens, reserveForResponse }, { provenance: true });
+  // Selection, prices, summary leaves and Chronicle identity were captured
+  // together. Nothing below the await consults live history or an estimator.
+  const { provenance } = compiled;
+  const sourceById = new Map(provenance.sources.map(source => [source.id, source]));
 
   const entries = [];
   // Normalization may split one source entry into several rendered messages.
   // Charge every rendered part, but count the archived coverage only once.
   const coveredIds = new Set<string>();
-  let i = 0;
-  for (const e of compiled.messages) {
+  for (let i = 0; i < compiled.messages.length; i++) {
+    const e = compiled.messages[i];
+    const captured = provenance.entries[i];
     const blocks = e.content;
     const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
-    const rendered = cm.estimateContentTokens(blocks, compiled.tokenCalibration);
+    const rendered = captured.renderedTokens;
     const nImages = countMetadataImages(blocks);
-    const sum = e.sourceMessageId || e.sourceMessageIds?.length ? undefined : byHead.get(headOf(text));
-    if (sum) {
-      const leafIds = leaves(sum).filter((id) => msgById.has(id));
-      let rawCovered = 0;
-      for (const id of leafIds) {
-        if (coveredIds.has(id)) continue;
-        coveredIds.add(id);
-        rawCovered += cm.estimateContentTokens(msgById.get(id)!.content ?? [], compiled.tokenCalibration);
-      }
-      const dates = leafIds.map((id) => msgById.get(id)!.timestamp).filter(Boolean).sort();
-      entries.push({
-        i: i++, kind: `L${sum.level}`, id: sum.id, participant: e.participant,
-        rendered, rawCovered, msgCount: leafIds.length, nImages,
-        dateFirst: dates[0] ?? null, dateLast: dates[dates.length - 1] ?? null, text,
-      });
-    } else {
-      const sourceIds = e.sourceMessageIds ?? (e.sourceMessageId ? [e.sourceMessageId] : []);
-      const sources = sourceIds.map(id => msgById.get(id)).filter(source => source !== undefined);
-      const dates = sources.map(source => source.timestamp).filter(Boolean).sort();
-      let rawCovered = sources.length ? 0 : rendered;
-      for (const source of sources) {
-        if (coveredIds.has(source.id)) continue;
-        coveredIds.add(source.id);
-        rawCovered += cm.estimateContentTokens(source.content ?? [], compiled.tokenCalibration);
-      }
-      entries.push({
-        i: i++, kind: 'raw', id: e.sourceMessageId ?? sourceIds[0] ?? null, participant: e.participant,
-        rendered, rawCovered, msgCount: sources.length || 1, nImages,
-        dateFirst: dates[0] ?? null, dateLast: dates[dates.length - 1] ?? null, text,
-      });
+    const isSummary = captured.summaryLevel !== null;
+    const sources = captured.sourceMessageIds.map(id => sourceById.get(id)).filter(source => source !== undefined);
+    const dates = sources.map(source => source.timestamp).sort((a, b) => a.getTime() - b.getTime());
+    // Unavailable summary leaves are not invented. Raw/generated entries with
+    // no available originals retain their explicit rendered-cost fallback.
+    let rawCovered = isSummary || sources.length ? 0 : rendered;
+    for (const source of sources) {
+      if (coveredIds.has(source.id)) continue;
+      coveredIds.add(source.id);
+      rawCovered += source.tokens;
     }
+    entries.push({
+      i, kind: isSummary ? `L${captured.summaryLevel}` : 'raw',
+      id: isSummary ? captured.sourceSummaryIds[0] : e.sourceMessageId ?? captured.sourceMessageIds[0] ?? null,
+      participant: e.participant, rendered, rawCovered,
+      msgCount: isSummary ? sources.length : sources.length || 1, nImages,
+      dateFirst: dates[0] ?? null, dateLast: dates[dates.length - 1] ?? null, text,
+    });
   }
   return {
     agent: agentName,
     generatedAt: new Date().toISOString(),
-    branch: cm.currentBranch().name,
+    branch: provenance.branch.name,
     budget: { maxTokens, reserveForResponse },
     totals: {
       entries: entries.length,
