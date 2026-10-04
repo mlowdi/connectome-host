@@ -406,7 +406,6 @@ function handleSessionList(app: AppContext): CommandResult {
 
 function handleSessionNew(app: AppContext, name?: string): CommandResult {
   const session = app.sessionManager.createSession(name);
-  resetBranchState(app.branchState);
 
   return {
     lines: [{ text: `Switching to new session: ${session.name} [${session.id}]...`, style: 'system' }],
@@ -423,13 +422,6 @@ function handleSessionSwitch(app: AppContext, nameOrId?: string): CommandResult 
   if (!session) {
     return { lines: [{ text: `Session "${nameOrId}" not found. Use /session list.`, style: 'system' }] };
   }
-
-  const active = app.sessionManager.getActiveSession();
-  if (active && session.id === active.id) {
-    return { lines: [{ text: `Already on session "${session.name}".`, style: 'system' }] };
-  }
-
-  resetBranchState(app.branchState);
 
   return {
     lines: [{ text: `Switching to session: ${session.name} [${session.id}]...`, style: 'system' }],

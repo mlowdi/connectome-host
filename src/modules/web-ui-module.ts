@@ -1277,9 +1277,10 @@ export class WebUiModule implements Module {
 
   /**
    * Context curve (GET /debug/context/curve[?agent=<name>]): per-entry
-   * provenance of the live compiled window. Same side-effect class as
-   * previewActivation / makeup: the compile may commit resolution updates,
-   * exactly as the agent's own next turn would. No inference, no writes.
+   * provenance of the metadata-selected live window. Read-only/dry-run:
+   * no inference or persisted resolution changes; size-bearing image refs
+   * need no blob reads, with lazy length inspection only for necessary legacy
+   * selection-boundary candidates.
    */
   private async handleContextCurve(url: URL): Promise<Response> {
     const app = this.panelApp();

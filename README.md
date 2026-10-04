@@ -322,6 +322,22 @@ non-loopback binds require basic-auth credentials. Build the SPA bundle once wit
 For SPA development: `cd web && bun run dev` proxies the Vite dev server onto a
 locally running host.
 
+### Media policy and local source dependencies
+
+MCP tool replies and imported Codex user/tool-output images remain structured visuals through primary requests, later tool rounds, maintenance/compression and restart. Mixed text/image order is preserved, including nested results and XML continuations. Recipe strategy settings `maxLiveImages`, `maxLiveImageBytes` (base64 encoded length), and `imageStripDepthTokens` apply to the next live request as well as compiled history; zero disables the corresponding ceiling. Newest eligible images are retained, and dropped images get explicit placeholders without modifying the original archive. Invalid image sources produce bounded unavailable-image content rather than encoded JSON prose. Internal operator events retain typed arrays, but CLI, headless JSONL and Web UI message inputs remain text-only; this does not add image upload.
+
+Subagent prompt admission and context-curve estimates price attachments by their stamped `tokenEstimate`, or 1600 when absent, rather than base64/JSON length. Rendered context and unique covered raw history are separate estimates. Context curves use public read-only `ContextManager.compileMetadata`: new size-bearing refs require no blob reads; legacy unsized refs may require lazy byte-length inspection of a necessary selection-boundary candidate, even if it ultimately remains summarized. Diagnostics do not encode image payloads, eagerly resolve the full archive or persist selection changes.
+
+This branch source-links `@animalabs/agent-framework`, `@animalabs/context-manager` and `@animalabs/membrane` to the corresponding sibling directories. Keep all three checkouts available. Use `npm install --ignore-scripts --install-links=false` for source links, build Membrane → context-manager → agent-framework, and build the host SPA with `npm run build:web`; do not patch copied packages under `node_modules`. These are local fork changes, not an upstream/npm release. The Responses transport also permits omitted optional Membrane function arguments while preserving explicit strictness and native function definitions.
+
+Browser, CLI and headless replies without a selected channel remain visible in their operator surface and archive; absence of a Discord locus is not a delivery failure. Genuine selected-channel failures retain durable receipts, including delayed publication while a conversation fork closes. Session switches activate the new session only after successful creation; failure restores the prior archive, checkpoints and live observers. Concurrent switches are rejected rather than racing activation. Session auto-naming and TUI fleet summaries use the active configured model on the existing transport, with single-attempt auxiliary calls and guards against stale or manually overridden results.
+
+### Local repair acceptance
+
+The `repair/connectome-media-continuity` branch was exercised with 376 targeted regressions: Membrane 116, context-manager 35, agent-framework 142, and host 83. Source-linked dependency builds passed before runtime cutover. These are targeted acceptance results, not a claim that every repository's full suite passed.
+
+The isolated subscription-backed browser trial exercised sequential media reads under a one-image ceiling and an exact 764536-character base64 byte ceiling. Captured adapter requests retained the newest image and explicit drop markers without putting fixture bytes into ordinary text; the real model identified the retained blue triangle. Restarted original-record retrieval used sparse oldest-first history search followed by extraction and returned the original synthetic decision record. Actual terminal checks exercised failed-switch recovery, successful replacement, inference, original-history restoration and checkpoint retention. Operator-only replies generated no new false channel-delivery failures. Trial-specific policy ceilings were removed afterward; no personal history or identity was migrated.
+
 ## Slash commands
 
 | Command | Effect |

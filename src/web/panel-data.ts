@@ -24,6 +24,7 @@ import type { ContentBlock, NormalizedMessage, ToolDefinition } from '@animalabs
 import type { Recipe } from '../recipe.js';
 import type { CallLedger } from '../call-ledger.js';
 import type { QuotaMeter } from '../quota-meter.js';
+import { measureContent } from '../content-accounting.js';
 import {
   readMcplServersFile,
   DEFAULT_CONFIG_PATH,
@@ -1118,14 +1119,16 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
  * token estimate, the raw-history tokens it covers (leaf messages,
  * recursively through the summary tree), date span, and full text.
  *
- * Same side-effect class as previewActivation / makeup: the compile may
- * commit resolution updates, exactly as the agent's own next turn would.
- * No inference, no message writes.
+ * Uses a noncommitting metadata selection: the same live budget and media
+ * policy, with no inference or persistent resolution writes.
+ * Content prices and provenance use unresolved refs. New refs need no media
+ * reads; necessary legacy count/depth/budget boundary candidates may need lazy
+ * byte-length inspection for exact selection, even if ultimately summarized.
+ * No payload encoding/retention or eager full-archive resolution.
  */
 export async function buildContextCurve(app: PanelAppRef, agentName: string): Promise<Record<string, unknown>> {
-  requireAgent(app, agentName);
-  const agent = app.framework.getAgent(agentName)!;
-  const cm = (agent as unknown as { getContextManager: () => any }).getContextManager();
+  const agent = requireAgent(app, agentName);
+  const cm = agent.getContextManager();
   // Use the LIVE budget, not the recipe's. Runtime overrides persist in the
   // `framework/state` Chronicle slot and win over the recipe, so reading
   // app.recipe here plotted the wrong curve on any agent whose budget had
@@ -1139,7 +1142,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
     if (typeof live === 'number' && live > 0) maxTokens = live;
   } catch { /* keep the recipe fallback */ }
   const reserveForResponse = app.recipe.agent.maxTokens ?? 16_384;
-  const compiled = await cm.compile({ maxTokens, reserveForResponse });
+  const compiled = await cm.compileMetadata({ maxTokens, reserveForResponse });
 
   // Curve inspection only needs text and source metadata. Resolving every
   // historical blob here re-inlines all base64 media and can expand a
@@ -1150,17 +1153,6 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   const messages: Array<{ id: string; timestamp?: unknown; content?: unknown[] }> =
     cm.getMessageWindow(0, messageCount, { resolveBlobs: false }).messages;
   const msgById = new Map(messages.map((mm) => [mm.id, mm]));
-  const estimate = (mm: { content?: unknown[] }): number => {
-    let t = 0;
-    for (const b of (mm.content ?? []) as Array<Record<string, unknown>>) {
-      if (b?.type === 'text') t += Math.ceil(String(b.text ?? '').length / 4);
-      else if (b?.type === 'image') t += 1600;
-      else if (b?.type === 'tool_result') t += Math.ceil(JSON.stringify(b.content ?? '').length / 4);
-      else if (b?.type === 'tool_use') t += Math.ceil(JSON.stringify(b.input ?? {}).length / 4);
-      else if (b?.type === 'thinking') t += Math.ceil(String(b.thinking ?? '').length / 4);
-    }
-    return t;
-  };
 
   type Summary = { id: string; level: number; content: string; sourceLevel: number; sourceIds: string[] };
   const strategy = cm.getStrategy() as { summaries?: Summary[] };
@@ -1181,18 +1173,23 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   };
 
   const entries = [];
+  // Normalization may split one source entry into several rendered messages.
+  // Charge every rendered part, but count the archived coverage only once.
+  const coveredIds = new Set<string>();
   let i = 0;
-  for (const e of compiled.messages as Array<{ participant: string; content?: unknown[]; sourceMessageId?: string }>) {
-    const blocks = (e.content ?? []) as Array<Record<string, unknown>>;
-    const text = blocks.filter((b) => b?.type === 'text').map((b) => String(b.text ?? '')).join('\n');
-    const nImages = blocks.filter((b) => b?.type === 'image').length;
-    const rendered = Math.ceil(text.length / 4) + nImages * 1600 +
-      blocks.filter((b) => b?.type === 'tool_result' || b?.type === 'tool_use')
-        .reduce((a, b) => a + Math.ceil(JSON.stringify(b.input ?? b.content ?? '').length / 4), 0);
-    const sum = byHead.get(headOf(text));
+  for (const e of compiled.messages) {
+    const blocks = e.content;
+    const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+    const { tokens: rendered, nImages } = measureContent(blocks);
+    const sum = e.sourceMessageId || e.sourceMessageIds?.length ? undefined : byHead.get(headOf(text));
     if (sum) {
       const leafIds = leaves(sum).filter((id) => msgById.has(id));
-      const rawCovered = leafIds.reduce((a, id) => a + estimate(msgById.get(id)!), 0);
+      let rawCovered = 0;
+      for (const id of leafIds) {
+        if (coveredIds.has(id)) continue;
+        coveredIds.add(id);
+        rawCovered += measureContent(msgById.get(id)!.content ?? []).tokens;
+      }
       const dates = leafIds.map((id) => msgById.get(id)!.timestamp).filter(Boolean).sort();
       entries.push({
         i: i++, kind: `L${sum.level}`, id: sum.id, participant: e.participant,
@@ -1200,11 +1197,19 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
         dateFirst: dates[0] ?? null, dateLast: dates[dates.length - 1] ?? null, text,
       });
     } else {
-      const src = e.sourceMessageId ? msgById.get(e.sourceMessageId) : null;
+      const sourceIds = e.sourceMessageIds ?? (e.sourceMessageId ? [e.sourceMessageId] : []);
+      const sources = sourceIds.map(id => msgById.get(id)).filter(source => source !== undefined);
+      const dates = sources.map(source => source.timestamp).filter(Boolean).sort();
+      let rawCovered = sources.length ? 0 : rendered;
+      for (const source of sources) {
+        if (coveredIds.has(source.id)) continue;
+        coveredIds.add(source.id);
+        rawCovered += measureContent(source.content ?? []).tokens;
+      }
       entries.push({
-        i: i++, kind: 'raw', id: e.sourceMessageId ?? null, participant: e.participant,
-        rendered, rawCovered: src ? estimate(src) : rendered, msgCount: 1, nImages,
-        dateFirst: src?.timestamp ?? null, dateLast: src?.timestamp ?? null, text,
+        i: i++, kind: 'raw', id: e.sourceMessageId ?? sourceIds[0] ?? null, participant: e.participant,
+        rendered, rawCovered, msgCount: sources.length || 1, nImages,
+        dateFirst: dates[0] ?? null, dateLast: dates[dates.length - 1] ?? null, text,
       });
     }
   }

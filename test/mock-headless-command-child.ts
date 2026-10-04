@@ -6,9 +6,10 @@ import type { AppContext } from '../src/index.js';
 await runHeadless({
   recipe: { name: 'command-owner-test', agent: { name: 'fixture' } },
   agentName: 'fixture',
+  onFrameworkChanged: () => () => {},
   framework: {
     getAllAgents: () => [{ name: 'fixture', state: { status: 'idle' } }],
-    onTrace: () => {},
+    onTrace: () => () => {},
     stop: async () => {},
     puppetToolCall: async (_agent: string, _tool: string, input: Record<string, string>) => {
       while (!existsSync(input.release!)) await Bun.sleep(10);

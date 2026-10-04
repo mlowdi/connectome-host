@@ -156,19 +156,26 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
   // Subscribed to framework traces from process startup; accumulates state for
   // the lifetime of the child. Drives the 'describe' response. Same reducer
   // shape runs in the parent for fleet children — see UNIFIED-TREE-PLAN.md §2.
-  const treeReducer = new AgentTreeReducer();
-  try {
-    treeReducer.seedFrameworkAgents(app.framework.getAllAgents().map(a => a.name));
-  } catch (err) {
-    log(`seed framework agents failed: ${String(err)}`);
-  }
+  let treeReducer: AgentTreeReducer;
+  let detachTrace: (() => void) | undefined;
+  let detachSpeechTrace: (() => void) | undefined;
+  let detachSpeechChanges: (() => void) | undefined;
+  const bindTrace = (framework: AppContext['framework']): void => {
+    detachTrace?.();
+    treeReducer = new AgentTreeReducer();
+    try {
+      treeReducer.seedFrameworkAgents(framework.getAllAgents().map(a => a.name));
+    } catch (err) {
+      log(`seed framework agents failed: ${String(err)}`);
+    }
+    detachTrace = framework.onTrace((traceEvent) => {
+      treeReducer.applyEvent(traceEvent);
+      emit(traceEvent as unknown as Record<string, unknown>);
+    });
+  };
+  bindTrace(app.framework);
+  const detachFrameworkChanges = app.onFrameworkChanged(bindTrace);
   const startedAt = Date.now();
-
-  // -- Wire framework trace events to socket and reducer --
-  app.framework.onTrace((traceEvent) => {
-    treeReducer.applyEvent(traceEvent);
-    emit(traceEvent as unknown as Record<string, unknown>);
-  });
 
   // -- Command dispatch --
   async function dispatchCommand(cmd: IncomingCommand, requester: Socket): Promise<void> {
@@ -227,8 +234,12 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
           }
         }
         if (result.switchToSessionId) {
-          await app.switchSession(result.switchToSessionId);
-          reply({ type: 'command-output', text: 'Session switched.', style: 'system' });
+          try {
+            await app.switchSession(result.switchToSessionId);
+            reply({ type: 'command-output', text: 'Session switched.', style: 'system' });
+          } catch (error) {
+            reply({ type: 'command-output', text: `Session switch failed: ${String(error)}`, style: 'error' });
+          }
         }
         if (result.quit) {
           await gracefulShutdown('command:/quit');
@@ -476,6 +487,10 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     // Give the exiting event a tick to flush onto the socket.
     await new Promise((r) => setTimeout(r, 50));
 
+    detachFrameworkChanges();
+    detachSpeechChanges?.();
+    detachTrace?.();
+    detachSpeechTrace?.();
     try { await app.framework.stop(); } catch (err) { log(`framework.stop() failed: ${String(err)}`); }
     try { server.close(); } catch (err) { log(`server.close() failed: ${String(err)}`); }
     try { if (existsSync(socketPath)) unlinkSync(socketPath); } catch (err) { log(`socket unlink failed: ${String(err)}`); }
@@ -514,27 +529,34 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     // not the final speech).  Emitted on inference:completed if non-empty.
     let currentSpeech = '';
 
-    app.framework.onTrace((event) => {
-      const t = (event as { type?: string }).type;
-      const agentName = (event as { agentName?: string }).agentName;
+    const bindSpeech = (framework: AppContext['framework']): void => {
+      detachSpeechTrace?.();
+      hadAtLeastOneInference = false;
+      idleSince = 0;
+      idleEmitted = false;
+      currentSpeech = '';
+      detachSpeechTrace = framework.onTrace((event) => {
+        const t = event.type;
+        const agentName = 'agentName' in event && typeof event.agentName === 'string'
+          ? event.agentName : undefined;
 
-      if (t === 'inference:started') {
-        hadAtLeastOneInference = true;
-        idleEmitted = false;  // new activity — allow another idle emit when it ends
-        if (agentName === primaryAgentName) currentSpeech = '';
-      } else if (t === 'inference:tokens' && agentName === primaryAgentName) {
-        const content = (event as { content?: string }).content;
-        if (content) currentSpeech += content;
-      } else if (t === 'inference:tool_calls_yielded' && agentName === primaryAgentName) {
-        // Tool-call round: speech so far was thought preamble, not final.
-        currentSpeech = '';
-      } else if (t === 'inference:completed' && agentName === primaryAgentName) {
-        if (currentSpeech) {
-          emit({ type: 'inference:speech', agentName, content: currentSpeech });
+        if (t === 'inference:started') {
+          hadAtLeastOneInference = true;
+          idleEmitted = false;
+          if (agentName === primaryAgentName) currentSpeech = '';
+        } else if (t === 'inference:tokens' && agentName === primaryAgentName) {
+          if ('content' in event && typeof event.content === 'string') currentSpeech += event.content;
+        } else if (t === 'inference:tool_calls_yielded' && agentName === primaryAgentName) {
+          // Tool-call preamble is not the final speech.
+          currentSpeech = '';
+        } else if (t === 'inference:completed' && agentName === primaryAgentName) {
+          if (currentSpeech) emit({ type: 'inference:speech', agentName, content: currentSpeech });
+          currentSpeech = '';
         }
-        currentSpeech = '';
-      }
-    });
+      });
+    };
+    bindSpeech(app.framework);
+    detachSpeechChanges = app.onFrameworkChanged(bindSpeech);
 
     const idlePoll = setInterval(() => {
       if (shuttingDown) { clearInterval(idlePoll); return; }

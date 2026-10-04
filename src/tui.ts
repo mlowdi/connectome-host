@@ -31,7 +31,8 @@ import {
 import { createWriteStream, mkdirSync } from 'node:fs';
 import type { AgentFramework, SessionUsage } from '@animalabs/agent-framework';
 import type { AutobiographicalStrategy } from '@animalabs/context-manager';
-import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
+import type { Membrane } from '@animalabs/membrane';
+import { FleetActivitySummaries } from './synesthete.js';
 import type { SubagentModule, ActiveSubagent } from './modules/subagent-module.js';
 import { FleetTreeAggregator } from './state/fleet-tree-aggregator.js';
 import type { AgentNode } from './state/agent-tree-reducer.js';
@@ -147,12 +148,14 @@ export function shortAgentName(full: string): string {
 interface AppContext {
   framework: AgentFramework;
   membrane: Membrane;
+  agentName: string;
   sessionManager: import('./session-manager.js').SessionManager;
   recipe: import('./recipe.js').Recipe;
   branchState: import('./commands.js').BranchState;
   userMessageCount: number;
   quotaMeter?: import('./quota-meter.js').QuotaMeter | null;
   switchSession(id: string): Promise<void>;
+  onFrameworkChanged(listener: (framework: AgentFramework) => void): () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +270,6 @@ type StreamBlockType = 'text' | 'thinking' | 'tool_call' | 'tool_result';
 // ---------------------------------------------------------------------------
 
 export async function runTui(app: AppContext): Promise<void> {
-  const membrane = app.membrane;
 
   // Redirect stderr to a log file — console.error is invisible once the TUI owns the terminal
   const logDir = process.env.DATA_DIR || './data';
@@ -285,7 +287,9 @@ export async function runTui(app: AppContext): Promise<void> {
 
   // Set terminal title
   const recipeName = app.recipe?.name ?? 'connectome-host';
-  const rootAgentName = app.recipe?.agent?.name ?? 'agent';
+  const rootAgentName = app.agentName;
+  let observedFramework = app.framework;
+  let observedSessionId = app.sessionManager.getActiveSession()?.id;
   process.stdout.write(`\x1b]0;${recipeName}\x07`);
 
   const state: TuiState = {
@@ -471,75 +475,19 @@ export async function runTui(app: AppContext): Promise<void> {
 
   // ── Agent observability maps ──────────────────────────────────────
 
-  /** Accumulated transcript per agent (text output + tool calls). Retention
-   *  is capped; the synesthete summarizer only ever reads the last 10k. */
-  const agentTranscripts = new Map<string, string>();
-  const TRANSCRIPT_CAP = 30_000;
-  /** Cumulative appended chars per agent — drives the "enough new text to
-   *  re-summarize" delta, which transcript.length can't once it hits the cap. */
-  const transcriptTotalLen = new Map<string, number>();
-
   /** Parent tracking: child short name → parent full agent name. */
   const agentParent = new Map<string, string>();
 
   /** Last known input token count per agent (= context window size). */
   const agentContextTokens = new Map<string, number>();
 
-  /** Synesthete summary per agent, keyed by full agent name. */
-  const summaryCache = new Map<string, string>();
-  const summarySnapshotLen = new Map<string, number>();
-  const summaryPending = new Set<string>();
-  /** Earliest next attempt per agent after a FAILED summary call. Without
-   *  this, a failing provider (outage, 429 storm) meets the 500ms poll tick
-   *  and becomes a 2 Hz per-agent inference retry hose — summaryPending only
-   *  guards concurrency, not the gap between a fast failure and the next tick. */
-  const summaryBackoffUntil = new Map<string, number>();
-
-  const SUMMARY_DELTA = 2000;
-  const SUMMARY_WINDOW = 10_000;
-  const SUMMARY_FAILURE_BACKOFF_MS = 30_000;
-
-  function appendTranscript(agent: string, text: string) {
-    const next = (agentTranscripts.get(agent) ?? '') + text;
-    agentTranscripts.set(agent, next.length > TRANSCRIPT_CAP ? next.slice(-TRANSCRIPT_CAP) : next);
-    transcriptTotalLen.set(agent, (transcriptTotalLen.get(agent) ?? 0) + text.length);
-  }
+  /** Active-transport summaries with session-scoped async bookkeeping. */
+  const summaries = new FleetActivitySummaries(app, rootAgentName);
 
   async function generateSummary(agentName: string) {
-    if (summaryPending.has(agentName)) return;
-    if (Date.now() < (summaryBackoffUntil.get(agentName) ?? 0)) return;
-    const transcript = agentTranscripts.get(agentName);
-    if (!transcript || transcript.length < 50) return;
-
-    const totalLen = transcriptTotalLen.get(agentName) ?? 0;
-    const lastLen = summarySnapshotLen.get(agentName) ?? 0;
-    if (totalLen - lastLen < SUMMARY_DELTA && summaryCache.has(agentName)) return;
-
-    summaryPending.add(agentName);
-    try {
-      const window = transcript.slice(-SUMMARY_WINDOW);
-      const request: NormalizedRequest = {
-        messages: [{
-          participant: 'user',
-          content: [{ type: 'text', text: `Agent activity stream:\n\n${window}\n\nWhat is this agent doing right now? Answer in 5-10 words.` }],
-        }],
-        system: 'You distill an agent\'s activity into a terse status phrase. 5-10 words max. No punctuation. Specific, not generic.',
-        config: { model: 'claude-haiku-4-5-20251001', maxTokens: 40, temperature: 0.3 },
-      };
-      const response = await membrane.complete(request);
-      const text = response.content
-        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-        .map(b => b.text).join('').trim();
-      summaryCache.set(agentName, text.length > 60 ? text.slice(0, 57) + '...' : text);
-      summarySnapshotLen.set(agentName, totalLen);
-      summaryBackoffUntil.delete(agentName);
-      if (state.viewMode === 'fleet') updateFleetView();
-    } catch {
-      // Best-effort display — but never an unthrottled retry loop.
-      summaryBackoffUntil.set(agentName, Date.now() + SUMMARY_FAILURE_BACKOFF_MS);
-    } finally {
-      summaryPending.delete(agentName);
-    }
+    if (state.status === 'switching') return;
+    const changed = await summaries.update(agentName);
+    if (changed && state.viewMode === 'fleet') updateFleetView();
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────
@@ -1212,12 +1160,12 @@ export async function runTui(app: AppContext): Promise<void> {
     const fullName = node.kind === 'fleet-child' || node.kind === 'fleet-child-agent'
       ? null
       : node.kind === 'researcher' ? rootAgentName
-      : [...agentTranscripts.keys()].find(k => k === node.name || shortAgentName(k) === node.name);
+      : [...summaries.agentNames()].find(k => k === node.name || shortAgentName(k) === node.name);
     if (fullName) {
-      const summary = summaryCache.get(fullName);
+      const summary = summaries.get(fullName);
       if (summary) {
         lines.push({ text: `  ${detail}┈ ${summary}`, color: DIM_GRAY });
-      } else if (summaryPending.has(fullName)) {
+      } else if (summaries.isPending(fullName)) {
         lines.push({ text: `  ${detail}┈ …`, color: DIM_GRAY });
       }
       // Summary GENERATION is triggered from the poll tick, not here —
@@ -1679,6 +1627,7 @@ export async function runTui(app: AppContext): Promise<void> {
   // ── Trace listener ──────────────────────────────────────────────────
 
   function onTrace(event: Record<string, unknown>) {
+    if (app.framework !== observedFramework || app.sessionManager.getActiveSession()?.id !== observedSessionId) return;
     const agent = event.agentName as string | undefined;
 
     switch (event.type) {
@@ -1735,7 +1684,7 @@ export async function runTui(app: AppContext): Promise<void> {
             updateStatus();
           }
           if (agent) {
-            appendTranscript(agent, content);
+            summaries.append(agent, content);
             // Project context growth: output tokens will be in context next round
             const prev = agentContextTokens.get(agent);
             if (prev) {
@@ -1849,7 +1798,7 @@ export async function runTui(app: AppContext): Promise<void> {
             const inp = c.input ? JSON.stringify(c.input) : '';
             return `[tool: ${c.name}${inp ? ' ' + inp.slice(0, 200) : ''}]`;
           }).join('\n');
-          appendTranscript(agent, '\n' + toolSnippet + '\n');
+          summaries.append(agent, '\n' + toolSnippet + '\n');
 
           // Track parent-child for fleet tree
           for (const call of calls) {
@@ -2232,14 +2181,9 @@ export async function runTui(app: AppContext): Promise<void> {
     procPeekLogs.clear();
     procPeekTokenLine.clear();
     procPeekLastEvent.clear();
-    agentTranscripts.clear();
-    transcriptTotalLen.clear();
     agentContextTokens.clear();
     agentParent.clear();
-    summaryCache.clear();
-    summarySnapshotLen.clear();
-    summaryPending.clear();
-    summaryBackoffUntil.clear();
+    summaries.reset();
     subagentPhase.clear();
     state.subagents = [];
     seenFleetHeaders.clear();
@@ -2247,6 +2191,30 @@ export async function runTui(app: AppContext): Promise<void> {
     expandedNodes.add(rootAgentName);
     fleetCursor = 0;
     initTreeAggregator();
+  }
+
+  // Session switches can originate outside the TUI (for example the Web UI).
+  // The host notifies before replacement/restored runtime start: capture its
+  // first traces without carrying over old transcripts or module subscriptions.
+  function rebindSession(): void {
+    observedFramework.offTrace(onTrace as (e: unknown) => void);
+    cleanupPeek();
+    cleanupPeekProc();
+    observedFramework = app.framework;
+    observedSessionId = app.sessionManager.getActiveSession()?.id;
+    subMod = observedFramework.getAllModules().find(m => m.name === 'subagent') as SubagentModule | undefined;
+    fleetMod = observedFramework.getAllModules().find(m => m.name === 'fleet') as FleetModule | undefined;
+    subscribeFleetOps();
+    resetObservabilityState();
+    observedFramework.onTrace(onTrace as (e: unknown) => void);
+    refreshFromStore();
+    addLine(`Session: ${app.sessionManager.getActiveSession()?.name ?? 'unknown'}`, GRAY);
+    // Quota belongs to the credential, while usage and alerts belong to a session.
+    state.tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
+      ...(state.tokens.quota !== undefined ? { quota: state.tokens.quota } : {}) };
+    state.ctxTokens = 0;
+    opsAlerts.clear();
+    updateStatus();
   }
 
   // Subscription host: the status line carries quota windows, not dollars.
@@ -2264,6 +2232,14 @@ export async function runTui(app: AppContext): Promise<void> {
   }
 
   const pollTimer = setInterval(() => {
+    if (app.framework !== observedFramework || app.sessionManager.getActiveSession()?.id !== observedSessionId) {
+      // Framework observers own rebinding; never use a mismatched runtime
+      // while a transition or failed recovery is still being resolved.
+      summaries.reset();
+      if (state.status !== 'error') state.status = 'switching';
+      updateStatus();
+      return;
+    }
     // Animate spinner when researcher is active (not just on token events)
     if (state.status !== 'idle' && state.status !== 'error') {
       spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
@@ -2293,12 +2269,12 @@ export async function runTui(app: AppContext): Promise<void> {
       if (state.viewMode === 'peek-proc') updatePeekProcView();
     }
     // Synesthete summaries for the fleet view. Triggered here — NOT from the
-    // render path — so a repaint can never originate a Haiku call.
+    // render path — so a repaint can never originate a provider call.
     // generateSummary self-throttles (pending guard + 2k-char delta).
     if (state.viewMode === 'fleet') {
       generateSummary(rootAgentName);
       for (const sa of state.subagents) {
-        const full = [...agentTranscripts.keys()].find(k => k === sa.name || shortAgentName(k) === sa.name);
+        const full = [...summaries.agentNames()].find(k => k === sa.name || shortAgentName(k) === sa.name);
         if (full) generateSummary(full);
       }
     }
@@ -2617,32 +2593,12 @@ export async function runTui(app: AppContext): Promise<void> {
 
       // Session switch: async teardown + rebuild
       if (result.switchToSessionId) {
-        state.status = 'switching';
-        updateStatus();
-        app.framework.offTrace(onTrace as (e: unknown) => void);
-
-        app.switchSession(result.switchToSessionId).then(() => {
-          // Rebind to new framework
-          subMod = app.framework.getAllModules().find(m => m.name === 'subagent') as SubagentModule | undefined;
-          fleetMod = app.framework.getAllModules().find(m => m.name === 'fleet') as FleetModule | undefined;
-          subscribeFleetOps();
-          resetObservabilityState();
-          app.framework.onTrace(onTrace as (e: unknown) => void);
-
-          const session = app.sessionManager.getActiveSession();
-          refreshFromStore();
-          addLine(`Session: ${session?.name ?? 'unknown'}`, GRAY);
-          // The quota readout belongs to the credential, not the session.
-          state.tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
-            ...(state.tokens.quota !== undefined ? { quota: state.tokens.quota } : {}) };
-          state.ctxTokens = 0;
-          // Alerts describe the OLD session's strategy/agents; the new
-          // session's own klaxons re-fire within their alarm interval if the
-          // condition still holds there. A stale alert with no reachable
-          // all-clear would otherwise pin the status bar red forever.
-          opsAlerts.clear();
+        if (result.switchToSessionId !== observedSessionId) {
+          summaries.reset();
+          state.status = 'switching';
           updateStatus();
-        }).catch(err => {
+        }
+        app.switchSession(result.switchToSessionId).catch(err => {
           addLine(`Session switch failed: ${err}`, RED);
           state.status = 'error';
           updateStatus();
@@ -2704,11 +2660,14 @@ export async function runTui(app: AppContext): Promise<void> {
   if (session) addLine(`Session: ${session.name}`, DIM_GRAY);
   addLine(`Error log: ${logPath}`, DIM_GRAY);
   app.framework.onTrace(onTrace as (e: unknown) => void);
+  const releaseFrameworkObserver = app.onFrameworkChanged(rebindSession);
   loadSessionHistory();
 
   // ── Cleanup ────────────────────────────────────────────────────────
 
   function cleanup() {
+    releaseFrameworkObserver();
+    summaries.reset();
     releaseQuotaWatch?.();
     unsubQuota?.();
     cleanupPeek();
@@ -2718,7 +2677,7 @@ export async function runTui(app: AppContext): Promise<void> {
     treeAggregator?.dispose();
     for (const unsub of subagentStreamUnsubs) unsub();
     clearInterval(pollTimer);
-    app.framework.offTrace(onTrace as (e: unknown) => void);
+    observedFramework.offTrace(onTrace as (e: unknown) => void);
     renderer.destroy();
     process.stdout.write('\x1b]0;\x07');
     // Restore stderr
