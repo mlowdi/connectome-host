@@ -8,11 +8,13 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface, type Interface as ReadLineInterface } from 'node:readline';
-import { OpenAIResponsesAPIAdapter, type CredentialResolver } from '@animalabs/membrane';
+import { MembraneError, OpenAIResponsesAPIAdapter, type CredentialResolver, type ProviderRequest, type ProviderRequestOptions, type StreamCallbacks } from '@animalabs/membrane';
+import { ARCHIVAL_CYBER_POLICY_FALLBACK_MODEL, providerArchivalMemoryProvenance, enforceArchivalMemoryBudget, validateArchivalServedModel } from './archival-memory-budget.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -337,10 +339,17 @@ export interface CodexSubscriptionAdapterConfig extends CodexAppServerAuthConfig
 export class CodexSubscriptionAdapter extends OpenAIResponsesAPIAdapter {
   override readonly name = 'openai-codex';
   private readonly auth: CodexAuthProvider;
+  // Allocated only for an admitted Blue request. The stored request belongs
+  // to its async invocation, never to an adapter-wide current-model flag.
+  private fallbackAuthScope?: AsyncLocalStorage<ProviderRequest | undefined>;
 
   constructor(config: CodexSubscriptionAdapterConfig = {}) {
     const auth = config.authProvider ?? new CodexAppServerAuth(config);
     const credentials: CredentialResolver = async ({ forceRefresh }) => {
+      if (forceRefresh && this.fallbackAuthScope?.getStore()) throw new MembraneError({
+        type: 'auth', retryable: false, rawError: undefined,
+        message: 'Archival fallback authentication failed; credential redispatch is disabled',
+      });
       const token = await auth.getAccessToken(forceRefresh);
       const accountId = auth.getAccountId?.();
       return { token, headers: accountId ? { 'ChatGPT-Account-Id': accountId } : undefined };
@@ -356,6 +365,34 @@ export class CodexSubscriptionAdapter extends OpenAIResponsesAPIAdapter {
       ),
     });
     this.auth = auth;
+  }
+
+  override async complete(request: ProviderRequest, options?: ProviderRequestOptions) {
+    // Subscription completions use the stream transport, with one admission.
+    return this.stream(request, { onChunk: () => {} }, options);
+  }
+
+  override async stream(request: ProviderRequest, callbacks: StreamCallbacks, options?: ProviderRequestOptions) {
+    const provenance = providerArchivalMemoryProvenance(request);
+    if (!provenance) return this.fallbackAuthScope
+      ? this.fallbackAuthScope.run(undefined, () => super.stream(request, callbacks, options))
+      : super.stream(request, callbacks, options);
+    const admittedOptions: ProviderRequestOptions = {
+      ...options,
+      onRequest: body => {
+        // Upstream invokes this on the final body before credentials/fetch;
+        // exceptions propagate as failed work, not diagnostic-only warnings.
+        options?.onRequest?.(body);
+        enforceArchivalMemoryBudget(body, provenance);
+      },
+    };
+    const blue = provenance.model === ARCHIVAL_CYBER_POLICY_FALLBACK_MODEL;
+    const scope = this.fallbackAuthScope ?? (blue ? (this.fallbackAuthScope = new AsyncLocalStorage()) : undefined);
+    const response = scope
+      ? await scope.run(blue ? request : undefined, () => super.stream(request, callbacks, admittedOptions))
+      : await super.stream(request, callbacks, admittedOptions);
+    validateArchivalServedModel(response.raw, provenance.model, response.model);
+    return response;
   }
 
   /** Subscription utilization windows, or null when the auth provider has no

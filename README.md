@@ -293,6 +293,213 @@ npm install
 | `MODEL` | from recipe or provider default | Override model |
 | `DATA_DIR` | `./data` | Session and recipe storage |
 
+## Dated native history backfill
+
+`scripts/backfill-history.ts --help` describes a separate, explicitly named private
+candidate. Preparation and ingestion never call a model or modify originals/the
+live session. Only `drain <instance> --apply` forms native memories, using exactly
+`openai-codex/gpt-6.1-sol`, a privately provisioned Codex subscription, and the full
+recipe system prompt plus the unchanged parent-authored framing file. Carrier
+ground remains the primary Agent/CM system prompt; exact framing is appended once
+to each memory directive through the existing strategy `identityReminder`, including
+auxiliary transitions. It is not an instruction for ordinary primary chat. Agent
+construction initializes native ground and real activation refreshes its composed
+system injections and installs the actual activation's live tools; pure preview
+replaces neither native ground nor the live tool surface. Staging and archival-lineage
+memory requests have no active tools/MCPL; ordinary live tool policy without archival
+lineage is unchanged. No API-key/provider fallback exists.
+
+The manifest is `{ "version": 1, "cutoff": "2026-10-04T22:00:00.000Z",
+"sources": [...] }`. Every explicit file needs `id`, `kind` (`note`, `claude-code`,
+`omp`, `handoff`), `path`, `scope`, `decision` (`include`, `exclude`, `candidate`,
+`quarantine`), `reason`, and `timezone`. Included conversations additionally need
+`sessionId` and explicit `assistantAliases` (empty means unattributed). Included
+notes need `author` and `date: {start, end?, precision}`; `precision` is `day`,
+`range`, or `millisecond`. This is the **write date**, with an explicitly derived
+native indexing anchor for coarse dates; `coveredDateRange` separately preserves
+the dates described by the note. `recordIds` selects source records (complete
+observed Claude stream groups are included); `branchHeads` labels selected heads
+without erasing alternate observations. `active: true` on an OMP source captures
+only its verified complete newline prefix for normalization; an excluded incomplete
+tail has its own private `.partial-tail.original` snapshot and SHA-256 disposition.
+Prefix plus tail recover the captured original bytes exactly. Capture and prefix
+verification require a stable inode, byte digest and nanosecond mtime/ctime interval;
+a post-hash in-place rewrite is not accepted merely because size/inode are unchanged.
+Concurrent changes retry up to three times, then report unstable/rewritten source.
+Stable later suffix growth is allowed; prefix rewriting/replacement or private
+tail-snapshot corruption is reported by verification. `mediaRoot` explicitly
+locates content-addressed OMP resources. No glob, HOME, sidecar, auth, config or
+history-index scan implies eligibility.
+
+Raw dialogue is before the specified cutoff; explicitly selected authored notes
+through October 5 remain eligible, and the supplied version-1 `records[]` handoff
+is the final direct-dialogue bridge. Every record/block has an audited disposition.
+Historical tool activity is inert, markup is escaped, private thinking/credentials
+are excluded from inference, and validated media references retain recovery links.
+Only genuine Claude assistant `message.id` groups coalesce streamed blocks. Stable
+OMP/handoff IDs with conflicting payloads quarantine every occurrence; exact repeated
+records retain one event with an explicit duplicate disposition. Malformed recognized
+parent IDs are quarantined, never coerced into roots; descendants retain the explicit
+quarantined-ancestor gap. Original snapshots and per-record/block hashes remain the
+private recovery authority.
+
+```bash
+bun scripts/backfill-history.ts --help
+bun scripts/backfill-history.ts prepare --manifest /private/sources.json \
+  --recipe /private/full-recipe.json --framing /private/parent-framing.md \
+  --out /private/new-candidate
+bun scripts/backfill-history.ts ingest /private/new-candidate --apply --max-events 100
+CODEX_HOME=/private/codex-home CODEX_BINARY=/supported/codex \
+  bun scripts/backfill-history.ts drain /private/new-candidate --apply --max-steps 1
+bun scripts/backfill-history.ts status /private/new-candidate --json
+bun scripts/backfill-history.ts verify /private/new-candidate --json
+# Repeat ingest/drain against the SAME candidate; omitting --apply is a dry run.
+```
+
+For a reviewed exact-event omission, derive a **new empty native candidate** from
+an immutable prepared parent, without parsing or copying its original sources:
+
+```bash
+bun scripts/backfill-history.ts derive /private/original-candidate \
+  --exclude-events /private/reviewed-decision.json \
+  --framing /private/parent-authored-framing.md --out /private/filtered-candidate --json
+```
+
+The explicit decision is version 1 with `originFingerprint`, `originSessionId`,
+nonempty unique `selectedSummaryIds` (audit labels, not selectors), nonempty unique
+`eventKeys` (exact `HistoricalEvent.key` values), and `reason`. Optional audit fields
+are `rawSourceCount`, `logicalEventCount`,
+`wholeEventExclusionHasNoAdditionalNativeShards`, `newCandidateRequired`,
+`existingSummariesMustNotBeReusedWithoutCompleteDependencyEvidence`,
+`missingAcceptedPreimageCount`, and `reviewProseMustNotEnterLiveContext`.
+Counts must be nonnegative integers (source/event counts positive); logical count
+must equal the key count, and a supplied raw count must match complete parent
+native shard mappings when available. Supplied safety flags must be `true`.
+Unknown fields/keys, duplicate keys, foreign origin identities, output collisions
+(including dangling symlinks), and symlink-traversing outputs are rejected.
+
+Surviving normalized records retain every field, payload hash and chronological
+position verbatim. Source attribution and every existing disposition row remain;
+contributing omitted records are marked `exclude` with the exact decision reason
+and receipt reference. `omissions.json` declares exact keys and body-free record
+coverage; `derivation.json` binds the ordered normalized parent lineage. Both are
+immutable fingerprint inputs. Missing/changed policy, inconsistent coverage or
+excluded event admission fails closed before memory inference. Reports distinguish
+retained eligible events, omitted logical events, omitted contributing disposition
+records, native messages and the original parent fingerprint/session. A stale native
+inspection is recovery-required debt, never successful `noWork`.
+
+Raw `.original`/partial-tail snapshots, old native rows, summaries, queues and
+accepted-request preimages are never copied. Only validated media referenced by
+surviving events is copied into `sources/media/`; source snapshot pointers and
+active-prefix verification are replaced with passive parent-only lineage. The new
+root/files are private (0700/0600). Native initialization uses the same machinery as
+`prepare`, with a new session, empty checkpoint and zero native memory debt. Ground,
+compiled profiles and archival routing stay unchanged; supplied parent framing is
+byte-exact. Enabled host semantic history already salts its namespace prefix with
+the new session id, preventing old remote summary-ID collisions; boolean history
+configuration does not enable semantic search. No model/tool/network work occurs
+in derivation or ingestion. Only explicit `drain --apply` authors new memories.
+
+Already filtered parents cannot be derived again. For another reviewed cut, derive
+the complete reviewed union from the immutable **original** parent. A derived
+manifest cannot be passed to raw `prepare` to bypass its omissions. This is an
+exact act/record exclusion, not a topic/string blacklist or semantic-safety proof;
+independently retained events can legitimately contain similar material. Original
+archives stay untouched outside the successor. Real decisions, omission framing,
+private corpus operations and promotion remain parent-owned.
+
+The private root contains `recipe.json`, `ground.md`, `framing.md`, `instance.json`
+(including the source-path map), immutable `sources/`, `events.jsonl`,
+`dispositions.json`, `checkpoint.json`, `audit.json`, `inspection.json`, and native
+`data/sessions.json` plus `data/sessions/<id>/`. Native source-key/range mapping and
+persisted archival boundaries recover interrupted appends and memory commits;
+`flock` plus Chronicle ownership prevents concurrent writers. Corpus/order/ground/
+profile conflicts require a **new candidate**, never surgery on committed history.
+Large UTF-safe byte-bounded fragments remain separate native sources; explicit
+archival seals include protected windows and partial tails without changing live
+window/default policy. The shared profile is chunk 24000, summary 1536, merge 4,
+holdback 0, adaptive/kv-stable; total context 604608, head 512, recent 150000,
+response 4096, stream 2418432, compression output 8192, compression context 600512,
+and recall 200000 tokens. Both standalone drain and the generated host use the
+same archival admission rule on the final normalized Responses body. Native
+builders place validated model/budget provenance only on their owned final memory
+directive; it is adapter metadata, never transmitted input or inferred from source
+prose. After late caller callbacks, Codex completion/streaming recursively rejects
+non-wire provenance keys anywhere in the final body, invalid provenance and over-cap
+requests before auth/network dispatch; inert key names in prose remain data. Both
+standalone and generated archival routes reject a differing provider-served response
+model before returning accepted output. Untagged ordinary primary/live requests are
+unchanged.
+Archival builders use this existing final-body guard as a local admission oracle.
+Only its safe `archival_memory_local_cap` discriminator permits fitting: remove
+whole oldest optional recall Q/A pairs, never raw target acts or mandatory ground,
+frame, head or uncovered context. Merges prefer the existing deeper target; if it
+still fails with no optional pairs, show **every selected source's exact native
+recollection**, with truthful shown-level evidence and unchanged source ownership.
+This is an admission representation choice, not a model refusal. Local misses
+invoke no auth/fetch/model and consume no provider-response attempts. If the full
+mandatory representation still fails, durable `admission_rejected` debt remains
+not-ready until explicit recovery; no source subset, truncation or reserve/profile
+change is permitted. Branch and archival generation are rechecked after every
+await before rebuilding, redispatching, logging or mutating native work.
+Accepted archival L1/merge hashes and exact normalized JSON preimages name only
+the request actually admitted, including genuine carrier-transport fallback.
+Preimages are retained at the existing native acceptance seam without changing
+the shared profile; ordinary live mint preimages remain opt-in. Earlier accepted
+requests are not retroactively backfilled or re-authored. Standalone privacy
+masking preserves safe type/retryability and the local-cap discriminator but no
+raw request/error material; invalid provenance and provider errors never invite
+local fitting.
+Audits distinguish actual serialized-body UTF-8 bytes, a conservative input-token
+**upper bound**, native estimated tokens, requested output reserve, and observed
+provider usage. Subscription transport does not transmit `max_output_tokens`, so
+the reserve is not a claimed physical output limit. The upper bound is not measured
+tokens, an API byte limit, or an 800k context proof.
+Over-cap/auth/provider failures leave resumable work, not empty successful memory.
+Failed archival L1 provider/commit work stays queued on the same manager. Terminal
+L1 refusal/empty output and exhausted merges remain quarantined and **not ready**;
+there is no automatic paid retry loop. After inspecting the native failure receipts,
+the existing strategy APIs `clearCompressionRefusalQuarantine` (then reseal the
+same endpoint) or `clearMergeQuarantine` permit explicit recovery without changing
+raw sources or earlier summaries. A namespace with durable archival intent refuses
+stale ordinary or archival mirrors before native writes/dispatch and after async
+successes and errors, before retries, carrier redispatch, dequeue, quarantine, clear
+or paid-debt sweep. Durable enqueue generations distinguish clear/re-enqueue even
+when the source IDs and attempts are otherwise identical. Close/reopen to adopt the
+current seals and fully loaded debt mirrors. Repeated finalization persists an
+ordinary-to-archival transition without duplicating its boundary. Inspection checks
+unique exact recursive source membership and reciprocal native parent links.
+Successful drain clears the active failure marker, not cumulative failure history.
+`noWork: true` additionally requires a current fingerprint/checkpoint/native-file
+inspection, valid source links and no L1/merge quarantine debt; stale receipts,
+including a checkpoint-before-inspection crash, report recovery required.
+
+`status`/`verify` read the last closed-writer receipt without opening/ticking
+Chronicle. They report coverage, exclusions/quarantine/media issues, leaves/merges,
+prompt/model/profile and recovery debt; no-work is separate from errors. After PM
+acceptance only, the generated recipe can open the candidate directly with
+`MODEL=gpt-6.1-sol DATA_DIR='/private/new-candidate/data' bun src/index.ts '/private/new-candidate/recipe.json'`.
+`prepare` returns the shell-quoted invocation for the actual output path, pinning
+`MODEL` even if the caller has an inherited override. Literal recipe credential
+fields (including MCP bearer `token` and environment keys such as `ZULIP_KEY`) are
+rejected before creating any candidate. Credential fields must remain private runtime
+references such as `${PRIVATE_RUNTIME_KEY}` or `${PRIVATE_RUNTIME_KEY:-}`; a literal
+credential mixed with interpolation or used as a nonempty fallback is not permitted.
+Noncredential environment settings remain literal. Provision runtime credentials
+privately. The handoff's original `sourceBranch` remains explicit in normalized provenance.
+
+For private native retrieval, obtain the candidate's store path through
+`SessionManager.getStorePath(instance.sessionId)` and open a caller-owned `JsStore` /
+`ContextManager` at namespace `agents/liv` with the same `PROFILE` and `auditOnly: true`,
+`autoTickOnNewMessage: false`. Use `getMessage`, inclusive `queryMessagesByTime`,
+`getSummariesInRange`, `searchSummaries` and `getSummary`; L1 `sourceIds` name raw
+messages, while higher levels name child summaries. Do not tick/reset/finalize in
+inspection. Close the ContextManager, then the caller-owned store in nested `finally`.
+Selective quarantine clear/reseal is instead a writable operator action under
+`withWriter`, with all other owners closed; it is not a read-only status operation.
+Actual corpus selection, credentials, model runs and activation remain parent-owned.
+
 ## Running
 
 ```bash
